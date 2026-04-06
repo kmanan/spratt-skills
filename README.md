@@ -64,7 +64,20 @@ An email scanning cron extracts grocery/shopping order details from email confir
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
-### 5. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
+### 5. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
+
+Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft Graph API. Multi-account OAuth2 with auto-refreshing tokens. Calendar events support descriptions, attendees, and multi-calendar targeting — create a family appointment on the "For Family" calendar with attendees and notes in one command.
+
+**Why it exists:** The ClawHub outlook-plus skill only had basic event CRUD — no description/body field, no attendees, no multi-calendar targeting. For a household assistant that needs to create shared calendar events with notes ("doctor appointment — symptoms to discuss: ...") and invite family members, those are table-stakes features.
+
+| | |
+|---|---|
+| **What you get** | outlook-calendar.sh, outlook-mail.sh, outlook-setup.sh, outlook-token.sh |
+| **Dependencies** | bash, curl, jq. Azure CLI for initial setup only. |
+| **macOS-specific** | No |
+| **Setup time** | ~10 minutes |
+
+### 6. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
 
 Tracks "use it or lose it" credit card benefits — monthly credits, quarterly categories, semi-annual windows. A weekly cron checks what's expiring soon and notifies each cardholder via outbox + Apple Reminders. A monthly LLM-powered refresh searches the web for benefit changes so the database stays current without manual maintenance.
 
@@ -102,6 +115,7 @@ Email → email scan cron (Flash triage → extract)
                     ↓
               order-ingest.py → orders.sqlite
               trip-db.py → trips.sqlite
+              outlook-calendar.sh → Outlook calendar (with attendees + notes)
 
 Saturday cron → card-perks-check.py (deterministic)
                     ↓
