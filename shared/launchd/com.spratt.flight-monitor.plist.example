@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.spratt.flight-monitor</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>source /Users/YOUR_USER/.config/spratt/infrastructure/env.sh &amp;&amp; exec /usr/bin/python3 /Users/YOUR_USER/.config/spratt/infrastructure/flight-monitor/flight_monitor.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>PathState</key>
+        <dict>
+            <key>/Users/YOUR_USER/.config/spratt/infrastructure/flight-monitor/state.json</key>
+            <true/>
+        </dict>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USER/Library/Logs/spratt/flight-monitor.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USER/Library/Logs/spratt/flight-monitor.log</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USER/.config/spratt/infrastructure/flight-monitor</string>
+</dict>
+</plist>
