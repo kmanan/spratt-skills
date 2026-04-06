@@ -64,6 +64,19 @@ An email scanning cron extracts grocery/shopping order details from email confir
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
+### 5. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
+
+Tracks "use it or lose it" credit card benefits — monthly credits, quarterly categories, semi-annual windows. A weekly cron checks what's expiring soon and notifies each cardholder via outbox + Apple Reminders. A monthly LLM-powered refresh searches the web for benefit changes so the database stays current without manual maintenance.
+
+**Why it exists:** AMEX Platinum alone has 7+ expiring credits across monthly, semi-annual, and annual cycles. Nobody remembers them all. Spratt does.
+
+| | |
+|---|---|
+| **What you get** | card-perks-check.py (weekly cron), card-perks-refresh.py (monthly helper), SQLite schema (4 tables), SKILL.md for interactive acknowledgment |
+| **Dependencies** | Python 3, SQLite, Outbox (above), Apple Reminders via remindctl, Claude Haiku API (for monthly refresh, ~$0.03/mo) |
+| **macOS-specific** | Apple Reminders via remindctl (optional — remove reminder creation for Linux) |
+| **Setup time** | ~10 minutes (after Outbox is set up) |
+
 ---
 
 ## Architecture
@@ -89,6 +102,16 @@ Email → email scan cron (Flash triage → extract)
                     ↓
               order-ingest.py → orders.sqlite
               trip-db.py → trips.sqlite
+
+Saturday cron → card-perks-check.py (deterministic)
+                    ↓
+              cards.sqlite (benefits, usage tracking)
+                    ↓
+              outbox.sqlite + Apple Reminders (if expiring within 10 days)
+
+Monthly cron → card-perks-refresh.py dump → Haiku (web search + diff)
+                    ↓
+              cards.sqlite (benefit updates) → outbox notification if changed
 ```
 
 ---
@@ -135,6 +158,13 @@ pip3 install FlightRadarAPI
 cd ../email-to-orders
 cat schemas/orders.sql | sqlite3 orders.sqlite
 # Add the cron prompt to your OpenClaw cron jobs
+
+# 5. Add Card Perks Tracker
+cd ../card-perks
+cat schemas/cards.sql | sqlite3 cards.sqlite
+# Seed your cards and benefits (see card-perks/schemas/cards.sql for schema)
+# Configure HOLDER_RECIPIENTS in card-perks-check.py or set env vars
+# Add Saturday + monthly cron jobs to OpenClaw
 ```
 
 ---
