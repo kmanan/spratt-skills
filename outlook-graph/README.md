@@ -43,8 +43,10 @@ outlook-calendar.sh free "2026-04-06T09:00" "2026-04-06T17:00"
 
 ## Email Features
 
+The `inbox` and `unread` commands are scoped to the Inbox folder via `/mailFolders/Inbox/messages`. This means Outlook's spam/junk filtering is respected — emails that Outlook moves to Junk will not be returned. This is important when using LLM-driven email scanning, as phishing emails in the Junk folder could otherwise be processed as legitimate mail.
+
 ```bash
-# Read inbox
+# Read inbox (Inbox folder only — Junk/Spam excluded)
 outlook-mail.sh --account outlook inbox 10
 outlook-mail.sh --account outlook unread
 

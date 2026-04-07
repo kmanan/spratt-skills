@@ -49,16 +49,16 @@ find_folder_id() {
 
 case "$1" in
     inbox)
-        # List inbox messages
+        # List inbox messages (Inbox folder only — excludes Junk/Spam/Trash)
         COUNT=${2:-10}
-        curl -s "$API/messages?\$top=$COUNT&\$orderby=receivedDateTime%20desc&\$select=id,subject,from,receivedDateTime,isRead" \
+        curl -s "$API/mailFolders/Inbox/messages?\$top=$COUNT&\$orderby=receivedDateTime%20desc&\$select=id,subject,from,receivedDateTime,isRead" \
             -H "Authorization: Bearer $ACCESS_TOKEN" | jq '.value | to_entries | .[] | {n: (.key + 1), subject: .value.subject, from: .value.from.emailAddress.address, date: .value.receivedDateTime[0:16], read: .value.isRead, id: .value.id[-20:]}'
         ;;
-    
+
     unread)
-        # List unread messages
+        # List unread messages (Inbox folder only — excludes Junk/Spam/Trash)
         COUNT=${2:-20}
-        curl -s "$API/messages?\$filter=isRead%20eq%20false&\$top=$COUNT&\$orderby=receivedDateTime%20desc&\$select=id,subject,from,receivedDateTime" \
+        curl -s "$API/mailFolders/Inbox/messages?\$filter=isRead%20eq%20false&\$top=$COUNT&\$orderby=receivedDateTime%20desc&\$select=id,subject,from,receivedDateTime" \
             -H "Authorization: Bearer $ACCESS_TOKEN" | jq '.value | to_entries | .[] | {n: (.key + 1), subject: .value.subject, from: .value.from.emailAddress.address, date: .value.receivedDateTime[0:16], id: .value.id[-20:]}'
         ;;
     
