@@ -1,5 +1,4 @@
-
-![image (2)](https://github.com/user-attachments/assets/8955907b-b72e-4511-bc10-84ffebb9d80e)
+![image (2) (Small)](https://github.com/user-attachments/assets/1c4afea6-c572-48ff-9bbd-d1a3768f3fe1)
 
 # Spratt Skills — Household Automation Add-ons for OpenClaw
 
