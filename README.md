@@ -40,14 +40,14 @@ The LLM writes trip data directly to SQLite through a CLI (`trip-db.py add-fligh
 
 ### 3. [Flight Monitor](./flight-monitor/) — Real-Time Flight Tracking Daemon
 
-A persistent daemon that polls FlightRadar24, detects events (landing, delay, gate change, diversion), and sends notifications through the outbox. Adaptive polling — 3 minutes during active window, 30 minutes when idle. No LLM in the polling loop.
+A persistent daemon that polls FlightAware AeroAPI, detects events (landing, delay, gate change, diversion), and sends notifications through the outbox. Adaptive polling — 3 minutes during active window, 30 minutes when idle. No LLM in the polling loop.
 
-**Why it exists:** An LLM-mediated flight cron used browser scraping, couldn't interpret "not found," and self-deleted after "completing" with zero notifications sent. The daemon is deterministic, restartable, and survives reboots.
+**Why it exists:** An LLM-mediated flight cron used browser scraping, couldn't interpret "not found," and self-deleted after "completing" with zero notifications sent. The original implementation used `FlightRadarAPI` — a community scraper of FlightRadar24's public data, not an official API — which returned inconsistent results for valid flights. Migrated to FlightAware AeroAPI for stable, authenticated access.
 
 | | |
 |---|---|
 | **What you get** | flight_monitor.py, track_flight.py, state derivation from trips DB |
-| **Dependencies** | Python 3, FlightRadarAPI (`pip install FlightRadarAPI`), Outbox (above) |
+| **Dependencies** | Python 3, FlightAware AeroAPI key (~$5/mo), Outbox (above) |
 | **macOS-specific** | launchd plist (KeepAlive + PathState). Adaptable to systemd. |
 | **Setup time** | ~15 minutes (after Outbox is set up) |
 
@@ -107,7 +107,7 @@ Human → LLM → trip-db.py CLI (add-trip, add-flight, add-hotel, etc.)
 
               trip-flight-state.py → state.json
                     ↓
-              flight_monitor.py daemon (3 min polling) → FlightRadar24
+              flight_monitor.py daemon (3 min polling) → FlightAware AeroAPI
                     ↓ (on events)
               outbox.sqlite → sender.py → iMessage
 
@@ -164,7 +164,7 @@ cat schemas/trips.sql | sqlite3 trips.sqlite
 
 # 3. Add Flight Monitor
 cd ../flight-monitor
-pip3 install FlightRadarAPI
+# Set FLIGHTAWARE_API_KEY in env.sh
 # Install launchd plist (see flight-monitor/README.md)
 
 # 4. Add Email-to-Orders
