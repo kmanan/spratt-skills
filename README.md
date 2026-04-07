@@ -79,7 +79,20 @@ Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft 
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
-### 6. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
+### 6. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
+
+A SQLite database for places you want to remember — restaurants, bars, activities, attractions. Share an Instagram post, Google Maps link, Yelp page, or just say "remember that Thai place on Queen West" and it gets saved with category, cuisine, location, tags, and notes. Query by vibe ("date night spots"), location, cuisine, or who saved it. Track visits and ratings.
+
+**Why it exists:** Interesting places come from Instagram stories, friend recommendations, and articles — then get forgotten. This gives the LLM a structured place to save them and a way to surface them when you ask "where should we go for dinner?"
+
+| | |
+|---|---|
+| **What you get** | SKILL.md (OpenClaw skill definition), SQLite schema, setup script |
+| **Dependencies** | SQLite, OpenClaw browser tool (for Instagram/Facebook/TikTok URL extraction) |
+| **macOS-specific** | No |
+| **Setup time** | ~5 minutes |
+
+### 7. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
 
 Tracks "use it or lose it" credit card benefits — monthly credits, quarterly categories, semi-annual windows. A weekly cron checks what's expiring soon and notifies each cardholder via outbox + Apple Reminders. A monthly LLM-powered refresh searches the web for benefit changes so the database stays current without manual maintenance.
 
@@ -112,6 +125,9 @@ Human → LLM → trip-db.py CLI (add-trip, add-flight, add-hotel, etc.)
               flight_monitor.py daemon (3 min polling) → FlightAware AeroAPI
                     ↓ (on events)
               outbox.sqlite → sender.py → iMessage
+
+Human → LLM → places.sqlite (save place from URL or description)
+              LLM ← places.sqlite (query: "date night spots we haven't tried")
 
 Email → email scan cron (Flash triage → extract)
                     ↓
@@ -174,7 +190,12 @@ cd ../email-to-orders
 cat schemas/orders.sql | sqlite3 orders.sqlite
 # Add the cron prompt to your OpenClaw cron jobs
 
-# 5. Add Card Perks Tracker
+# 5. Add Places
+cd ../places
+bash examples/setup.sh
+# Copy SKILL.md to your OpenClaw skills directory
+
+# 6. Add Card Perks Tracker
 cd ../card-perks
 cat schemas/cards.sql | sqlite3 cards.sqlite
 # Seed your cards and benefits (see card-perks/schemas/cards.sql for schema)
