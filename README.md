@@ -25,18 +25,18 @@ A SQLite message queue with a polling daemon. The LLM writes messages to a table
 | **macOS-specific** | launchd plist for the daemon (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~15 minutes |
 
-### 2. [Trip Manager](./trip-manager/) — Manifest-Driven Trip Automation
+### 2. [Trip Manager](./trip-manager/) — Database-First Trip Automation
 
-Write a trip in natural markdown. An LLM extracts structured data into SQLite (trips, flights, hotels, reservations, travelers). Outbox messages are auto-generated for flight reminders, hotel check-ins, and dinner notifications. Flight monitor state is auto-derived. Change the manifest, everything downstream updates — only the changed items, no full regeneration.
+The LLM writes trip data directly to SQLite through a CLI (`trip-db.py add-flight`, `add-hotel`, etc.). Outbox messages are auto-generated for flight reminders, hotel check-ins, and dinner notifications. Flight monitor state is auto-derived. Update any record, regenerate downstream — only the changed items, no full regeneration.
 
-**Why it exists:** Trip details were hardcoded in cron prompts, state.json, and docs — three disconnected places. When a flight changed, nothing cascaded. The manifest pattern makes one file the source of truth with automatic downstream propagation.
+**Why it exists:** Family travel has dozens of moving parts — flights, hotels, restaurants, Uber links, group chat notifications — spread across confirmation emails and text threads. Without structure, details get lost and nobody gets reminded. The trip manager gives the LLM a single database to write to, and deterministic scripts handle all the downstream notification scheduling and flight tracking setup.
 
 | | |
 |---|---|
-| **What you get** | trip-sync.py (LLM extraction), trip-db.py (CLI), trip-outbox-gen.py, trip-status.py, trip-flight-state.py, SQLite schema (5 tables), message templates |
-| **Dependencies** | Python 3, SQLite, Claude Haiku API (for extraction, ~$0.01/call), Outbox (above) |
-| **macOS-specific** | launchd WatchPaths for auto-triggering on file change. Adaptable to inotifywait/fswatch on Linux. |
-| **Setup time** | ~30 minutes (after Outbox is set up) |
+| **What you get** | trip-db.py (CLI with 11 subcommands), trip-outbox-gen.py, trip-status.py, trip-flight-state.py, SQLite schema (5 tables) |
+| **Dependencies** | Python 3, SQLite, Outbox (above) |
+| **macOS-specific** | No (all scripts are standalone CLI tools) |
+| **Setup time** | ~15 minutes (after Outbox is set up) |
 
 ### 3. [Flight Monitor](./flight-monitor/) — Real-Time Flight Tracking Daemon
 
@@ -95,9 +95,7 @@ Tracks "use it or lose it" credit card benefits — monthly credits, quarterly c
 ## Architecture
 
 ```
-Human → LLM → Trip Manifest (markdown)
-                    ↓
-              trip-sync.py (Haiku extracts, ~$0.01)
+Human → LLM → trip-db.py CLI (add-trip, add-flight, add-hotel, etc.)
                     ↓
               trips.sqlite (trips, flights, hotels, reservations, travelers)
                     ↓
@@ -107,6 +105,8 @@ Human → LLM → Trip Manifest (markdown)
                     ↓
               sender.py daemon (60s polling) → imsg CLI → iMessage
 
+              trip-flight-state.py → state.json
+                    ↓
               flight_monitor.py daemon (3 min polling) → FlightRadar24
                     ↓ (on events)
               outbox.sqlite → sender.py → iMessage
@@ -137,7 +137,6 @@ Monthly cron → card-perks-refresh.py dump → Haiku (web search + diff)
 - SQLite 3
 - [OpenClaw](https://github.com/openclaw/openclaw) installed and running
 - [BlueBubbles](https://bluebubbles.app/) + imsg CLI for iMessage delivery (or adapt sender.py for your messaging platform)
-- Claude API key (for trip manifest extraction — Haiku tier, ~$0.01/call)
 
 ---
 
@@ -161,7 +160,7 @@ cat schemas/outbox.sql | sqlite3 outbox.sqlite
 # 2. Add Trip Manager
 cd ../trip-manager
 cat schemas/trips.sql | sqlite3 trips.sqlite
-# Install WatchPaths plist (see trip-manager/README.md)
+# The LLM uses trip-db.py CLI to write trip data — no daemon needed
 
 # 3. Add Flight Monitor
 cd ../flight-monitor
@@ -190,7 +189,7 @@ ClawHub skills are SKILL.md files — instructions that teach the LLM what to do
 These add-ons are **infrastructure that runs outside of OpenClaw**:
 - Daemons that poll, deliver, and monitor (launchd/systemd)
 - Databases that the LLM writes to and briefings read from
-- File watchers that trigger extraction pipelines
+- CLIs that validate input, handle timezone math, and enforce schema
 - Deterministic scripts that generate messages from templates
 
 The LLM interacts with this infrastructure through CLIs (`outbox.py schedule`, `trip-db.py add-flight`) and SQL queries. But the infrastructure itself runs without the LLM.
