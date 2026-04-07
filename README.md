@@ -55,18 +55,31 @@ A persistent daemon that polls FlightAware AeroAPI, detects events (landing, del
 
 ### 4. [Email-to-Orders](./email-to-orders/) — Automatic Order Tracking from Email
 
-An email scanning cron extracts grocery/shopping order details from email confirmations and inserts them into SQLite. Supports Instacart, Amazon Fresh, Whole Foods, DoorDash, and more. No manual entry — orders are ingested automatically from email.
+An email scanning cron extracts grocery/shopping order details from email confirmations and inserts them into SQLite. Supports Instacart, Amazon Fresh, Whole Foods, DoorDash, and more. No manual entry — orders are ingested automatically from email. Supports both insert and update-items modes so scrapers can fill in details later.
 
-**Why it exists:** "Did we already buy cilantro this week?" is a real question in a household. The orders database makes it queryable.
+**Why it exists:** "Did we already buy cilantro this week?" is a real question in a household. The orders database makes it queryable — search by item name and get back the order date, quantity, and price.
 
 | | |
 |---|---|
-| **What you get** | order-ingest.py (CLI), SQLite schema, email scan cron prompt template |
+| **What you get** | order-ingest.py (CLI with insert + update-items), SQLite schema, email scan cron prompt template |
 | **Dependencies** | Python 3, SQLite, an email scanning setup (Gmail via gog CLI, Outlook via Microsoft Graph, or any IMAP) |
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
-### 5. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
+### 5. [Instacart Orders](./instacart-orders/) — Browser-Based Order Scraping
+
+Instacart confirmation emails don't contain itemized order details — they just link to the Instacart site. This skill uses OpenClaw's browser automation to navigate to Instacart's receipt page and extract full item lists with names, quantities, and prices. Runs as a daily cron that fills in any orders with missing items.
+
+**Why it exists:** The email scanner ingests Instacart orders with empty items because the email body doesn't have them. This skill closes the loop by scraping the data from the source.
+
+| | |
+|---|---|
+| **What you get** | SKILL.md (browser scraping instructions), cron job template |
+| **Dependencies** | OpenClaw browser tool, Email-to-Orders (above), an active Instacart account logged in via the browser's `openclaw` profile |
+| **macOS-specific** | No |
+| **Setup time** | ~5 minutes (after Email-to-Orders is set up) |
+
+### 6. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
 
 Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft Graph API. Multi-account OAuth2 with auto-refreshing tokens. Calendar events support descriptions, attendees, and multi-calendar targeting — create a family appointment on the "For Family" calendar with attendees and notes in one command.
 
@@ -79,7 +92,7 @@ Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft 
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
-### 6. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
+### 7. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
 
 A SQLite database for places you want to remember — restaurants, bars, activities, attractions. Share an Instagram post, Google Maps link, Yelp page, or just say "remember that Thai place on Queen West" and it gets saved with category, cuisine, location, tags, and notes. Query by vibe ("date night spots"), location, cuisine, or who saved it. Track visits and ratings.
 
@@ -92,7 +105,7 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes |
 
-### 7. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
+### 8. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
 
 Tracks "use it or lose it" credit card benefits — monthly credits, quarterly categories, semi-annual windows. A weekly cron checks what's expiring soon and notifies each cardholder via outbox + Apple Reminders. A monthly LLM-powered refresh searches the web for benefit changes so the database stays current without manual maintenance.
 
@@ -131,9 +144,15 @@ Human → LLM → places.sqlite (save place from URL or description)
 
 Email → email scan cron (Flash triage → extract)
                     ↓
-              order-ingest.py → orders.sqlite
+              order-ingest.py → orders.sqlite (metadata, items if available)
               trip-db.py → trips.sqlite
               outlook-calendar.sh → Outlook calendar (with attendees + notes)
+
+              Instacart scraper cron (daily, browser automation)
+                    ↓
+              instacart.com/orders → receipt page → parse items
+                    ↓
+              order-ingest.py update-items → orders.sqlite (fills in items)
 
 Saturday cron → card-perks-check.py (deterministic)
                     ↓
@@ -188,14 +207,20 @@ cd ../flight-monitor
 # 4. Add Email-to-Orders
 cd ../email-to-orders
 cat schemas/orders.sql | sqlite3 orders.sqlite
-# Add the cron prompt to your OpenClaw cron jobs
+# Add the email scan cron prompt to your OpenClaw cron jobs
 
-# 5. Add Places
+# 5. Add Instacart Orders (fills in items the email scanner can't get)
+cd ../instacart-orders
+# Copy SKILL.md to your OpenClaw skills directory
+# Add the daily scraper cron job (see SKILL.md for cron template)
+# Make sure the openclaw browser profile is logged into Instacart
+
+# 6. Add Places
 cd ../places
 bash examples/setup.sh
 # Copy SKILL.md to your OpenClaw skills directory
 
-# 6. Add Card Perks Tracker
+# 7. Add Card Perks Tracker
 cd ../card-perks
 cat schemas/cards.sql | sqlite3 cards.sqlite
 # Seed your cards and benefits (see card-perks/schemas/cards.sql for schema)
