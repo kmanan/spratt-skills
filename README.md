@@ -1,3 +1,6 @@
+
+![image (2)](https://github.com/user-attachments/assets/8955907b-b72e-4511-bc10-84ffebb9d80e)
+
 # Spratt Skills — Household Automation Add-ons for OpenClaw
 
 A collection of infrastructure add-ons for [OpenClaw](https://github.com/openclaw/openclaw) that turn it into a household operating system. Built for a real family, running in production on a Mac Mini M4.
