@@ -32,15 +32,56 @@ def run(cmd):
 
 
 def resolve_destination(destination):
-    """Use goplaces to identify what's at the destination."""
-    code, out, err = run(f'goplaces resolve "{destination}" --json --limit 3')
-    if code != 0 or not out:
-        return None
-    try:
-        places = json.loads(out)
-        return places[0] if places else None
-    except json.JSONDecodeError:
-        return None
+    """Use goplaces to identify what's at the destination.
+
+    Tries two approaches:
+    1. goplaces resolve — works when Tesla sends a place name ("QFC", "Bright Horizons")
+    2. goplaces search — works when Tesla sends an address, searches for the business there
+
+    If neither finds a real business (only address types), returns the
+    address-only result. The daemon will stay silent for unrecognized places.
+    """
+    ADDRESS_ONLY = {"premise", "street_address", "route", "subpremise", "geocode"}
+
+    # Approach 1: resolve directly
+    code, out, _ = run(f'goplaces resolve "{destination}" --json --limit 3')
+    if code == 0 and out:
+        try:
+            places = json.loads(out)
+            if places:
+                # Check all results — sometimes the business is result 2 or 3
+                for place in places:
+                    types = set(place.get("types", []))
+                    if types and not types.issubset(ADDRESS_ONLY):
+                        return place
+
+                # All results were addresses — try search as fallback
+                loc = places[0].get("location", {})
+                lat, lng = loc.get("lat"), loc.get("lng")
+                if lat and lng:
+                    # Approach 2: search with destination text near the coordinates
+                    code2, out2, _ = run(
+                        f'goplaces search "{destination}" --json --limit 1 '
+                        f'--lat={lat} --lng={lng} --radius-m=100'
+                    )
+                    if code2 == 0 and out2:
+                        try:
+                            # goplaces search may include next_page_token after the array
+                            search_results = json.loads(out2.split("\n")[0]) if "\nnext_page_token:" in out2 else json.loads(out2)
+                            if search_results:
+                                candidate = search_results[0]
+                                ctypes = set(candidate.get("types", []))
+                                if not ctypes.issubset(ADDRESS_ONLY):
+                                    return candidate
+                        except json.JSONDecodeError:
+                            pass
+
+                # Return address-only result as last resort
+                return places[0]
+        except json.JSONDecodeError:
+            pass
+
+    return None
 
 
 def categorize(place_types):
