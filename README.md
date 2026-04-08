@@ -112,7 +112,21 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes |
 
-### 8. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
+### 8. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
+
+When you set a destination in your Tesla, this daemon detects it via Home Assistant's SSE stream and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know.
+
+**Why it exists:** "Bring diapers to daycare" sitting in a reminder list doesn't help if you only see it at 7am and forget by 5pm pickup. The reminder should surface when you're actually heading there.
+
+| | |
+|---|---|
+| **What you get** | destination-daemon.py (persistent SSE listener), destination-context.py (place resolver + context gatherer), SKILL.md |
+| **Dependencies** | Python 3, Home Assistant with Tesla integration, [goplaces](https://github.com/openclaw/goplaces) CLI (Google Places API), Outbox (above) |
+| **Schedule** | Persistent daemon. Reacts instantly when Tesla nav destination is set. Zero polling. |
+| **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
+| **Setup time** | ~10 minutes (after Outbox is set up) |
+
+### 9. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
 
 Tracks "use it or lose it" credit card benefits — monthly credits, quarterly categories, semi-annual windows. A weekly cron checks what's expiring soon and notifies each cardholder via outbox + Apple Reminders. A monthly LLM-powered refresh searches the web for benefit changes so the database stays current without manual maintenance.
 
@@ -161,6 +175,16 @@ Email → email scan cron (Flash triage → extract)
               instacart.com/orders → receipt page → parse items
                     ↓
               order-ingest.py update-items → orders.sqlite (fills in items)
+
+Tesla nav destination set → sensor.maha_tesla_destination changes
+                    ↓
+              destination-daemon.py (SSE listener, instant)
+                    ↓
+              goplaces resolve → identify place (grocery? daycare? doctor?)
+                    ↓
+              remindctl + icalBuddy → relevant context
+                    ↓
+              outbox.sqlite → sender.py → "🛒 Heading to QFC — cilantro, milk, paper towels"
 
 Saturday cron → card-perks-check.py (deterministic)
                     ↓
@@ -228,7 +252,14 @@ cd ../places
 bash examples/setup.sh
 # Copy SKILL.md to your OpenClaw skills directory
 
-# 7. Add Card Perks Tracker
+# 7. Add Destination-Aware Reminders
+cd ../destination-aware
+# Configure HA_URL and HA_TOKEN in ~/.config/home-assistant/config.json
+# Set GOOGLE_PLACES_API_KEY for goplaces
+# Edit scripts/destination-daemon.py with your phone number
+# Install launchd plist (see shared/launchd/)
+
+# 8. Add Card Perks Tracker
 cd ../card-perks
 cat schemas/cards.sql | sqlite3 cards.sqlite
 # Seed your cards and benefits (see card-perks/schemas/cards.sql for schema)
@@ -260,6 +291,7 @@ This system has been running in production for a household of 4 (2 adults, 2 kid
 - Email scanning across 4 accounts (2 Gmail, 2 Outlook)
 - Smart home control via Home Assistant
 - Grocery order tracking from Instacart and Amazon
+- Destination-aware reminders via Tesla navigation + Google Places
 
 The system handles ~20-30 messages/day through the outbox, costs ~$0.10-0.20/day in API calls, and has had zero missed message deliveries since the outbox pattern was implemented.
 
