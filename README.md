@@ -24,6 +24,7 @@ A SQLite message queue with a polling daemon. The LLM writes messages to a table
 |---|---|
 | **What you get** | outbox.py (CLI + Python API), sender.py (daemon), SQLite schema |
 | **Dependencies** | Python 3, SQLite, iMessage via [BlueBubbles](https://bluebubbles.app/) + imsg CLI |
+| **Schedule** | Persistent daemon (60s polling loop). Messages delivered within ~1 minute of scheduled time. |
 | **macOS-specific** | launchd plist for the daemon (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~15 minutes |
 
@@ -37,6 +38,7 @@ The LLM writes trip data directly to SQLite through a CLI (`trip-db.py add-fligh
 |---|---|
 | **What you get** | trip-db.py (CLI with 11 subcommands), trip-outbox-gen.py, trip-status.py, trip-flight-state.py, SQLite schema (5 tables) |
 | **Dependencies** | Python 3, SQLite, Outbox (above) |
+| **Schedule** | N/A — CLI tools invoked on demand by the LLM or by email scanning cron. |
 | **macOS-specific** | No (all scripts are standalone CLI tools) |
 | **Setup time** | ~15 minutes (after Outbox is set up) |
 
@@ -50,10 +52,11 @@ A persistent daemon that polls FlightAware AeroAPI, detects events (landing, del
 |---|---|
 | **What you get** | flight_monitor.py, track_flight.py, state derivation from trips DB |
 | **Dependencies** | Python 3, FlightAware AeroAPI key (~$5/mo), Outbox (above) |
+| **Schedule** | Persistent daemon. Polls every 3 min during active flight window, every 30 min when idle. |
 | **macOS-specific** | launchd plist (KeepAlive + PathState). Adaptable to systemd. |
 | **Setup time** | ~15 minutes (after Outbox is set up) |
 
-### 4. [Email-to-Orders](./email-to-orders/) — Automatic Order Tracking from Email
+### 4. [Email-to-Orders](./email-to-orders/) — Order Tracking from Email
 
 An email scanning cron extracts grocery/shopping order details from email confirmations and inserts them into SQLite. Supports Instacart, Amazon Fresh, Whole Foods, DoorDash, and more. No manual entry — orders are ingested automatically from email. Supports both insert and update-items modes so scrapers can fill in details later.
 
@@ -63,12 +66,13 @@ An email scanning cron extracts grocery/shopping order details from email confir
 |---|---|
 | **What you get** | order-ingest.py (CLI with insert + update-items), SQLite schema, email scan cron prompt template |
 | **Dependencies** | Python 3, SQLite, an email scanning setup (Gmail via gog CLI, Outlook via Microsoft Graph, or any IMAP) |
+| **Schedule** | Cron, 3x/day (7:30am, 1:30pm, 6pm). Scans emails from the last 8 hours regardless of read status. Orders may take up to ~6 hours to appear in the database after the email arrives. |
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
 ### 5. [Instacart Orders](./instacart-orders/) — Browser-Based Order Scraping
 
-Instacart confirmation emails don't contain itemized order details — they just link to the Instacart site. This skill uses OpenClaw's browser automation to navigate to Instacart's receipt page and extract full item lists with names, quantities, and prices. Runs as a daily cron that fills in any orders with missing items.
+Instacart confirmation emails don't contain itemized order details — they just link to the Instacart site. This skill uses OpenClaw's browser automation to navigate to Instacart's receipt page and extract full item lists with names, quantities, and prices.
 
 **Why it exists:** The email scanner ingests Instacart orders with empty items because the email body doesn't have them. This skill closes the loop by scraping the data from the source.
 
@@ -76,6 +80,7 @@ Instacart confirmation emails don't contain itemized order details — they just
 |---|---|
 | **What you get** | SKILL.md (browser scraping instructions), cron job template |
 | **Dependencies** | OpenClaw browser tool, Email-to-Orders (above), an active Instacart account logged in via the browser's `openclaw` profile |
+| **Schedule** | Cron, daily at 9pm. Finds orders with empty items and backfills them via browser. |
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes (after Email-to-Orders is set up) |
 
@@ -89,6 +94,7 @@ Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft 
 |---|---|
 | **What you get** | outlook-calendar.sh, outlook-mail.sh, outlook-setup.sh, outlook-token.sh |
 | **Dependencies** | bash, curl, jq. Azure CLI for initial setup only. |
+| **Schedule** | N/A — shell scripts invoked on demand by the LLM or by email scanning cron. |
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
@@ -102,6 +108,7 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 |---|---|
 | **What you get** | SKILL.md (OpenClaw skill definition), SQLite schema, setup script |
 | **Dependencies** | SQLite, OpenClaw browser tool (for Instagram/Facebook/TikTok URL extraction) |
+| **Schedule** | N/A — interactive skill, invoked on demand when user shares a place. |
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes |
 
@@ -115,6 +122,7 @@ Tracks "use it or lose it" credit card benefits — monthly credits, quarterly c
 |---|---|
 | **What you get** | card-perks-check.py (weekly cron), card-perks-refresh.py (monthly helper), SQLite schema (4 tables), SKILL.md for interactive acknowledgment |
 | **Dependencies** | Python 3, SQLite, Outbox (above), Apple Reminders via remindctl, Claude Haiku API (for monthly refresh, ~$0.03/mo) |
+| **Schedule** | Weekly cron (Saturdays) for expiration checks. Monthly cron for benefit refresh via web search. |
 | **macOS-specific** | Apple Reminders via remindctl (optional — remove reminder creation for Linux) |
 | **Setup time** | ~10 minutes (after Outbox is set up) |
 
