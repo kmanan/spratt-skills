@@ -140,6 +140,20 @@ Tracks "use it or lose it" credit card benefits — monthly credits, quarterly c
 | **macOS-specific** | Apple Reminders via remindctl (optional — remove reminder creation for Linux) |
 | **Setup time** | ~10 minutes (after Outbox is set up) |
 
+### 10. [Apple Reminders — Recurring](./apple-reminders/) — Recurring Reminder Support
+
+A compiled Swift binary that creates proper recurring Apple Reminders via EventKit. The `remindctl` CLI doesn't support recurrence, so without this, the LLM creates individual copies for each occurrence — fragile and cluttered.
+
+**Why it exists:** "Remind me every Monday to bring diapers to daycare" should create one recurring reminder, not 12 individual ones.
+
+| | |
+|---|---|
+| **What you get** | create-recurring-reminder (Swift binary + source) |
+| **Dependencies** | macOS, Swift compiler (Xcode Command Line Tools) |
+| **Schedule** | N/A — invoked on demand when user requests a recurring reminder. |
+| **macOS-specific** | Yes (EventKit is Apple-only) |
+| **Setup time** | ~2 minutes (compile + grant permissions) |
+
 ---
 
 ## Architecture
