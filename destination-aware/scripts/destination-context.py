@@ -42,41 +42,36 @@ def resolve_destination(destination):
     address-only result. The daemon will stay silent for unrecognized places.
     """
     ADDRESS_ONLY = {"premise", "street_address", "route", "subpremise", "geocode"}
+    ALL_CATEGORY_TYPES = GROCERY_TYPES | MEDICAL_TYPES | SCHOOL_TYPES | RESTAURANT_TYPES
 
-    # Approach 1: resolve directly
+    # Step 1: resolve directly (works when Tesla sends a place name)
     code, out, _ = run(f'goplaces resolve "{destination}" --json --limit 3')
     if code == 0 and out:
         try:
             places = json.loads(out)
             if places:
-                # Check all results — sometimes the business is result 2 or 3
                 for place in places:
                     types = set(place.get("types", []))
-                    if types and not types.issubset(ADDRESS_ONLY):
+                    if types & ALL_CATEGORY_TYPES:
                         return place
 
-                # All results were addresses — try search as fallback
-                loc = places[0].get("location", {})
-                lat, lng = loc.get("lat"), loc.get("lng")
-                if lat and lng:
-                    # Approach 2: search with destination text near the coordinates
+                # No category match — check if results are address-only
+                first_types = set(places[0].get("types", []))
+                if first_types.issubset(ADDRESS_ONLY):
+                    # Step 2: "place at" prefix trick for raw addresses
                     code2, out2, _ = run(
-                        f'goplaces search "{destination}" --json --limit 1 '
-                        f'--lat={lat} --lng={lng} --radius-m=100'
+                        f'goplaces resolve "place at {destination}" --json --limit 5'
                     )
                     if code2 == 0 and out2:
                         try:
-                            # goplaces search may include next_page_token after the array
-                            search_results = json.loads(out2.split("\n")[0]) if "\nnext_page_token:" in out2 else json.loads(out2)
-                            if search_results:
-                                candidate = search_results[0]
-                                ctypes = set(candidate.get("types", []))
-                                if not ctypes.issubset(ADDRESS_ONLY):
-                                    return candidate
+                            places2 = json.loads(out2)
+                            for place in places2:
+                                types = set(place.get("types", []))
+                                if types & ALL_CATEGORY_TYPES:
+                                    return place
                         except json.JSONDecodeError:
                             pass
 
-                # Return address-only result as last resort
                 return places[0]
         except json.JSONDecodeError:
             pass
