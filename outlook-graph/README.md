@@ -53,7 +53,9 @@ outlook-mail.sh --account outlook unread
 # Search (KQL syntax)
 outlook-mail.sh --account outlook search "subject:instacart OR subject:tracking"
 
-# Advanced queries
+# Advanced queries — time-based filtering (recommended for automated scanning)
+CUTOFF=$(date -u -v-8H '+%Y-%m-%dT%H:%M:%SZ')
+outlook-mail.sh --account outlook query --after "$CUTOFF" --folder Inbox --count 30
 outlook-mail.sh --account outlook query --after 2026-04-01 --from boss@work.com --has-attachments
 
 # Manage
@@ -61,6 +63,8 @@ outlook-mail.sh mark-read <id>
 outlook-mail.sh send "to@email.com" "Subject" "Body text"
 outlook-mail.sh reply <id> "Reply body"
 ```
+
+**Tip for email scanning crons:** Use `query --after` with a time window instead of `unread`. Filtering by unread status means emails the user has already opened get skipped, causing missed orders and notifications.
 
 ## Setup
 
