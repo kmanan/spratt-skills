@@ -20,32 +20,48 @@ MEDICAL_TYPES = {"doctor", "dentist", "hospital", "medical_lab", "pharmacy", "ph
 SCHOOL_TYPES = {"school", "preschool", "child_care_agency", "day_care"}
 RESTAURANT_TYPES = {"restaurant", "cafe", "bar", "meal_delivery", "meal_takeaway"}
 
-REMINDER_LISTS = ["Manan", "Shared", "Shopping"]
+REMINDER_LISTS = ["Manan", "Harshita", "Shared"]
 
 
-def run(cmd):
+def run(cmd, timeout=10):
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 1, "", "timeout"
     except Exception as e:
         return 1, "", str(e)
 
 
-def resolve_destination(destination):
+def resolve_destination(destination, lat=None, lng=None):
     """Use goplaces to identify what's at the destination.
 
-    Tries two approaches:
-    1. goplaces resolve — works when Tesla sends a place name ("QFC", "Bright Horizons")
-    2. goplaces search — works when Tesla sends an address, searches for the business there
-
-    If neither finds a real business (only address types), returns the
-    address-only result. The daemon will stay silent for unrecognized places.
+    If lat/lng are provided (from Tesla route tracker), uses location-biased
+    search first for best results. Falls back to resolve and "place at" trick.
     """
     ADDRESS_ONLY = {"premise", "street_address", "route", "subpremise", "geocode"}
     ALL_CATEGORY_TYPES = GROCERY_TYPES | MEDICAL_TYPES | SCHOOL_TYPES | RESTAURANT_TYPES
 
+    # Step 0: If we have coordinates, search near them (most reliable)
+    if lat and lng:
+        code, out, _ = run(
+            f'/opt/homebrew/bin/goplaces search "{destination}" --json --limit 3 '
+            f'--lat={lat} --lng={lng} --radius-m=500'
+        )
+        if code == 0 and out:
+            try:
+                # Handle next_page_token appended after JSON array
+                json_str = out.split("\nnext_page_token:")[0] if "\nnext_page_token:" in out else out
+                places = json.loads(json_str)
+                for place in places:
+                    types = set(place.get("types", []))
+                    if types & ALL_CATEGORY_TYPES:
+                        return place
+            except json.JSONDecodeError:
+                pass
+
     # Step 1: resolve directly (works when Tesla sends a place name)
-    code, out, _ = run(f'goplaces resolve "{destination}" --json --limit 3')
+    code, out, _ = run(f'/opt/homebrew/bin/goplaces resolve "{destination}" --json --limit 3')
     if code == 0 and out:
         try:
             places = json.loads(out)
@@ -60,7 +76,7 @@ def resolve_destination(destination):
                 if first_types.issubset(ADDRESS_ONLY):
                     # Step 2: "place at" prefix trick for raw addresses
                     code2, out2, _ = run(
-                        f'goplaces resolve "place at {destination}" --json --limit 5'
+                        f'/opt/homebrew/bin/goplaces resolve "place at {destination}" --json --limit 5'
                     )
                     if code2 == 0 and out2:
                         try:
@@ -102,14 +118,18 @@ def get_reminders(categories):
     """Fetch relevant reminders based on destination category."""
     parts = []
     if "grocery" in categories:
-        # Shopping list is the primary grocery list
-        code, out, _ = run("remindctl show all --list Shopping")
-        if code == 0 and out and out != "(none)":
-            parts.append(f"Shopping list:\n{out}")
-    # Always check personal and shared lists for any relevant items
-    for lst in REMINDER_LISTS:
-        code, out, _ = run(f"remindctl show all --list {lst}")
-        if code == 0 and out and out != "(none)":
+        # Grocery: only Shared list (household shopping items)
+        lists_to_check = ["Shared"]
+    elif "daycare" in categories:
+        # Daycare: all lists (could be kid-related items anywhere)
+        lists_to_check = REMINDER_LISTS
+    else:
+        # Everything else: all lists
+        lists_to_check = REMINDER_LISTS
+
+    for lst in lists_to_check:
+        code, out, _ = run(f"/opt/homebrew/bin/remindctl show all --list {lst}")
+        if code == 0 and out and out != "(none)" and "No reminders found" not in out:
             parts.append(f"{lst} list:\n{out}")
     return "\n\n".join(parts) if parts else None
 
@@ -117,7 +137,7 @@ def get_reminders(categories):
 def get_calendar_today():
     """Fetch today's calendar events with locations."""
     code, out, _ = run(
-        'icalBuddy -ea -nrd -eed -eep "notes,url,uid" '
+        '/opt/homebrew/bin/icalBuddy -ea -nrd -eed -eep "notes,url,uid" '
         '-ic "manankakkar@gmail.com,Kakkar\\, Manan K,Calendar,For Family,Family" '
         'eventsToday'
     )
@@ -127,12 +147,14 @@ def get_calendar_today():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--destination", required=True, help="Destination address from Tesla nav")
+    parser.add_argument("--lat", type=float, default=None, help="Destination latitude")
+    parser.add_argument("--lng", type=float, default=None, help="Destination longitude")
     args = parser.parse_args()
 
     destination = args.destination
 
     # Step 1: Resolve destination
-    place = resolve_destination(destination)
+    place = resolve_destination(destination, lat=args.lat, lng=args.lng)
 
     place_name = place.get("name", "Unknown") if place else "Unknown"
     place_address = place.get("address", destination) if place else destination
