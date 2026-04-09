@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Card Perks Refresh Helper — dumps current benefits for the monthly agentTurn.
+Card Wallet Refresh Helper — dumps current benefits and reward rates for the monthly agentTurn.
 
 Called by the monthly cron's agentTurn prompt to get a formatted snapshot of
 what's currently in the database. The LLM then compares this against web
 search results to detect changes.
 
 Usage:
-    python3 card-perks-refresh.py dump        # Print current benefits as text
-    python3 card-perks-refresh.py dump-json   # Print as JSON
+    python3 card-wallet-refresh.py dump        # Print current benefits + reward rates as text
+    python3 card-wallet-refresh.py dump-json   # Print as JSON (for programmatic use)
 """
 
 import sqlite3
@@ -16,10 +16,7 @@ import json
 import sys
 import os
 
-CARDS_DB = os.environ.get(
-    "CARDS_DB",
-    os.path.expanduser("~/.config/spratt/cards/cards.sqlite"),
-)
+CARDS_DB = os.path.expanduser("~/.config/spratt/cards/cards.sqlite")
 
 
 def get_db():
@@ -70,6 +67,40 @@ def dump_text():
         notes_str = f" — {r['notes']}" if r["notes"] else ""
         print(f"  [{status}] {r['name']}: ${r['amount']:.2f}/{r['cycle']} "
               f"({r['period_rule']}) @ {r['merchant']}{flag_str}{notes_str}")
+
+    # Also dump reward rates
+    print("\n## Reward Rates")
+    rates = conn.execute("""
+        SELECT c.holder, c.card_name, r.category, r.rate, r.cap_amount, r.cap_period, r.notes
+        FROM reward_rates r
+        JOIN cards c ON r.card_id = c.id
+        WHERE c.active = 1
+        ORDER BY c.holder, c.card_name, r.rate DESC
+    """).fetchall()
+
+    current_card = None
+    for r in rates:
+        card_key = f"{r['holder']} — {r['card_name']}"
+        if card_key != current_card:
+            print(f"\n### {card_key}")
+            current_card = card_key
+        cap_str = f" (cap: ${r['cap_amount']:.0f}/{r['cap_period']})" if r["cap_amount"] else ""
+        notes_str = f" — {r['notes']}" if r["notes"] else ""
+        print(f"  {r['category']}: {r['rate']}%{cap_str}{notes_str}")
+
+    # Dump quarterly categories if any
+    quarters = conn.execute("""
+        SELECT c.card_name, q.year, q.quarter, q.categories, q.activated
+        FROM quarterly_categories q
+        JOIN cards c ON q.card_id = c.id
+        ORDER BY q.year, q.quarter
+    """).fetchall()
+
+    if quarters:
+        print("\n## Quarterly Categories")
+        for q in quarters:
+            act = "✅" if q["activated"] else "❌"
+            print(f"  {q['card_name']} {q['year']}-Q{q['quarter']}: {q['categories']} {act}")
 
     conn.close()
 

@@ -56,23 +56,23 @@ A persistent daemon that polls FlightAware AeroAPI, detects events (landing, del
 | **macOS-specific** | launchd plist (KeepAlive + PathState). Adaptable to systemd. |
 | **Setup time** | ~15 minutes (after Outbox is set up) |
 
-### 4. [Email-to-Orders](./email-to-orders/) — Order Tracking from Email
+### 4. [Email-to-Orders](./email-to-orders/) — Order & Shipment Tracking from Email
 
-An email scanning cron extracts grocery/shopping order details from email confirmations and inserts them into SQLite. Supports Instacart, Amazon Fresh, Whole Foods, DoorDash, and more. No manual entry — orders are ingested automatically from email. Supports both insert and update-items modes so scrapers can fill in details later.
+An email scanning cron extracts grocery/shopping order details from email confirmations and inserts them into SQLite. Supports Instacart, Amazon Fresh, Whole Foods, DoorDash, and more. Also tracks shipping status — when a tracking number or delivery update arrives by email, it's stored on the order and the household gets notified for significant events (out for delivery, delivered).
 
-**Why it exists:** "Did we already buy cilantro this week?" is a real question in a household. The orders database makes it queryable — search by item name and get back the order date, quantity, and price.
+**Why it exists:** "Did we already buy cilantro this week?" and "Where's that Amazon package?" are real questions in a household. The orders database makes them queryable — search by item name, check delivery status, all from one place.
 
 | | |
 |---|---|
-| **What you get** | order-ingest.py (CLI with insert + update-items), SQLite schema, email scan cron prompt template |
+| **What you get** | order-ingest.py (CLI with insert, update-items, update-tracking), SQLite schema with tracking columns, email scan cron prompt template |
 | **Dependencies** | Python 3, SQLite, an email scanning setup (Gmail via gog CLI, Outlook via Microsoft Graph, or any IMAP) |
-| **Schedule** | Cron, 3x/day (7:30am, 1:30pm, 6pm). Scans emails from the last 8 hours regardless of read status. Orders may take up to ~6 hours to appear in the database after the email arrives. |
+| **Schedule** | Cron, 3x/day. Scans emails from the last 8 hours. |
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
 ### 5. [Instacart Orders](./instacart-orders/) — Browser-Based Order Scraping
 
-Instacart confirmation emails don't contain itemized order details — they just link to the Instacart site. This skill uses OpenClaw's browser automation to navigate to Instacart's receipt page and extract full item lists with names, quantities, and prices.
+Instacart confirmation emails don't contain itemized order details — they just link to the Instacart site. This skill uses OpenClaw's browser automation to navigate to Instacart's receipt page and extract full item lists with names, quantities, and prices. Now also captures **store names** to power per-store purchase cadence analysis.
 
 **Why it exists:** The email scanner ingests Instacart orders with empty items because the email body doesn't have them. This skill closes the loop by scraping the data from the source.
 
@@ -80,11 +80,27 @@ Instacart confirmation emails don't contain itemized order details — they just
 |---|---|
 | **What you get** | SKILL.md (browser scraping instructions), cron job template |
 | **Dependencies** | OpenClaw browser tool, Email-to-Orders (above), an active Instacart account logged in via the browser's `openclaw` profile |
-| **Schedule** | Cron, daily at 9pm. Finds orders with empty items and backfills them via browser. |
+| **Schedule** | Cron, daily at 9pm. Finds orders with empty items, backfills them, and classifies new item names via Flash. |
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes (after Email-to-Orders is set up) |
 
-### 6. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
+### 6. [Smart Reorder](./smart-reorder/) — Purchase Cadence Analysis + LLM Item Classification
+
+Analyzes your grocery purchase history to predict when you'll need to reorder each item. Calculates median days between purchases per product, flags items that are due or coming up soon. An LLM (Flash) classifies receipt item names into canonical products — so "QFC Vitamin D Whole Milk Half Gallon" and "QFC Vitamin D Whole Milk" are recognized as the same thing, while "Organic Valley Whole Milk" stays separate (different brand).
+
+Feeds into the [Instacart ordering skill](https://clawhub.com/skills/instacart-skill) (from ClawHub, by bigdaddyluke) for cart building.
+
+**Why it exists:** "We're out of milk again" shouldn't require remembering. The system knows you buy milk every 7 days and your last order was 8 days ago.
+
+| | |
+|---|---|
+| **What you get** | purchase-cadence.py (cadence analysis CLI), item-classify.py (alias management CLI), SQLite schema (item_aliases table) |
+| **Dependencies** | Python 3, SQLite, Email-to-Orders + Instacart Orders (above) for data. Flash (via nightly cron) for item classification. |
+| **Schedule** | Item classification runs as part of the nightly Instacart scraper cron. Cadence analysis is on-demand (called by the Instacart ordering skill or interactively). |
+| **macOS-specific** | No |
+| **Setup time** | ~5 minutes (after Instacart Orders is set up) |
+
+### 7. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
 
 Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft Graph API. Multi-account OAuth2 with auto-refreshing tokens. Calendar events support descriptions, attendees, and multi-calendar targeting — create a family appointment on the "For Family" calendar with attendees and notes in one command.
 
@@ -98,7 +114,7 @@ Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft 
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
-### 7. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
+### 8. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
 
 A SQLite database for places you want to remember — restaurants, bars, activities, attractions. Share an Instagram post, Google Maps link, Yelp page, or just say "remember that Thai place on Queen West" and it gets saved with category, cuisine, location, tags, and notes. Query by vibe ("date night spots"), location, cuisine, or who saved it. Track visits and ratings.
 
@@ -112,7 +128,7 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes |
 
-### 8. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
+### 9. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
 
 When you set a destination in your Tesla, this daemon detects it via Home Assistant's SSE stream and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know.
 
@@ -126,21 +142,35 @@ When you set a destination in your Tesla, this daemon detects it via Home Assist
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~10 minutes (after Outbox is set up). See [destination-aware/README.md](./destination-aware/README.md) for deployment gotchas. |
 
-### 9. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
+### 10. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
 
-Tracks "use it or lose it" credit card benefits — monthly credits, quarterly categories, semi-annual windows. A weekly cron checks what's expiring soon and notifies each cardholder via outbox + Apple Reminders. A monthly LLM-powered refresh searches the web for benefit changes so the database stays current without manual maintenance.
+Merged skill that tracks both **"use it or lose it" credit card benefits** (monthly credits, quarterly categories, semi-annual windows) and **per-purchase reward optimization** ("which card for groceries?"). A weekly cron checks expiring benefits and notifies each cardholder. A monthly LLM-powered refresh searches the web for benefit and reward rate changes. Interactive queries recommend the optimal card per spending category with cap awareness and network acceptance warnings (Amex fallbacks).
 
-**Why it exists:** AMEX Platinum alone has 7+ expiring credits across monthly, semi-annual, and annual cycles. Nobody remembers them all. Spratt does.
+**Why it exists:** AMEX Platinum alone has 7+ expiring credits across monthly, semi-annual, and annual cycles. Nobody remembers them all. And nobody does the math on "Chase Freedom 5% on rotating categories this quarter vs Apple Pay 2% vs Sapphire Reserve 3x dining" in their head. Spratt does both. Evolved from the standalone card-perks tracker by merging with the [card-optimizer](https://clawhub.com/skills/card-optimizer) skill from ClawHub (by scottfo).
 
 | | |
 |---|---|
-| **What you get** | card-perks-check.py (weekly cron), card-perks-refresh.py (monthly helper), SQLite schema (4 tables), SKILL.md for interactive acknowledgment |
+| **What you get** | card-wallet-check.py (weekly cron), card-wallet-refresh.py (monthly helper), SKILL.md (interactive benefit + purchase queries), SQLite schema (7 tables: cards, benefits, usage, benefit_changes, reward_rates, quarterly_categories, spending_estimates) |
 | **Dependencies** | Python 3, SQLite, Outbox (above), Apple Reminders via remindctl, Claude Haiku API (for monthly refresh, ~$0.03/mo) |
-| **Schedule** | Weekly cron (Saturdays) for expiration checks. Monthly cron for benefit refresh via web search. |
+| **Schedule** | Weekly cron (Saturdays) for expiration checks. Monthly cron for benefit + reward rate refresh. Quarterly cron (Jan/Apr/Jul/Oct) for rotating category lookups. |
 | **macOS-specific** | Apple Reminders via remindctl (optional — remove reminder creation for Linux) |
 | **Setup time** | ~10 minutes (after Outbox is set up) |
 
-### 10. [Apple Reminders — Recurring](./apple-reminders/) — Recurring Reminder Support
+### 11. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
+
+Weekly meal planning that reads from your recipe database, checks pantry inventory, and generates shopping lists that feed directly into the Instacart ordering pipeline. Handles dietary restrictions, household coordination (adults vs kids), batch cooking, and budget tracking. Based on the [meal-planner](https://clawhub.com/skills/meal-planner) skill from ClawHub (by clawic), adapted to use SQLite-backed recipes and the Instacart skill instead of standalone markdown files.
+
+**Why it exists:** Meal planning involves recipes you've saved, groceries you need to buy, and what's already in the pantry. Without integration, you're copying ingredient lists from one app to another. This connects the recipe database to the grocery pipeline so "plan this week's meals" ends with "cart built on Instacart, ready to place."
+
+| | |
+|---|---|
+| **What you get** | SKILL.md (planning instructions integrated with recipes.sqlite + Instacart pipeline), setup.md, shopping-guide.md, meal-prep.md, budget-tips.md, memory-template.md |
+| **Dependencies** | recipes.sqlite (from recipe-instacart skill), orders.sqlite (for purchase history), Instacart ordering skill (for cart building) |
+| **Schedule** | N/A — interactive skill, invoked on demand when user wants to plan meals. |
+| **macOS-specific** | No |
+| **Setup time** | ~5 minutes + first-use household onboarding conversation |
+
+### 12. [Apple Reminders — Recurring](./apple-reminders/) — Recurring Reminder Support
 
 A compiled Swift binary that creates proper recurring Apple Reminders via EventKit. The `remindctl` CLI doesn't support recurrence, so without this, the LLM creates individual copies for each occurrence — fragile and cluttered.
 
@@ -180,7 +210,7 @@ Human → LLM → places.sqlite (save place from URL or description)
 
 Email → email scan cron (Flash triage → extract)
                     ↓
-              order-ingest.py → orders.sqlite (metadata, items if available)
+              order-ingest.py → orders.sqlite (metadata, items, tracking)
               trip-db.py → trips.sqlite
               outlook-calendar.sh → Outlook calendar (with attendees + notes)
 
@@ -188,7 +218,23 @@ Email → email scan cron (Flash triage → extract)
                     ↓
               instacart.com/orders → receipt page → parse items
                     ↓
-              order-ingest.py update-items → orders.sqlite (fills in items)
+              order-ingest.py update-items → orders.sqlite (fills in items + store)
+                    ↓
+              item-classify.py → Flash classifies product names → item_aliases table
+
+Human → "we need groceries"
+                    ↓
+              purchase-cadence.py → median days between purchases per item
+                    ↓
+              due items → Instacart skill (browser) → cart built → user places order
+
+Human → "plan meals this week"
+                    ↓
+              meal-planner → reads recipes.sqlite + pantry inventory
+                    ↓
+              weekly plan + ingredient list
+                    ↓
+              Instacart skill (browser) → cart built → user places order
 
 Tesla nav destination set → sensor.maha_tesla_destination changes
                     ↓
@@ -200,16 +246,30 @@ Tesla nav destination set → sensor.maha_tesla_destination changes
                     ↓
               outbox.sqlite → sender.py → "🛒 Heading to QFC — cilantro, milk, paper towels"
 
-Saturday cron → card-perks-check.py (deterministic)
+Saturday cron → card-wallet-check.py (deterministic)
                     ↓
-              cards.sqlite (benefits, usage tracking)
+              cards.sqlite (benefits, reward_rates, usage tracking)
                     ↓
               outbox.sqlite + Apple Reminders (if expiring within 10 days)
 
-Monthly cron → card-perks-refresh.py dump → Haiku (web search + diff)
+Monthly cron → card-wallet-refresh.py dump → Haiku (web search + diff)
                     ↓
-              cards.sqlite (benefit updates) → outbox notification if changed
+              cards.sqlite (benefit + rate updates) → outbox notification if changed
+
+Human → "which card for dining?"
+                    ↓
+              reward_rates + quarterly_categories → best card recommendation
 ```
+
+---
+
+## ClawHub Credits
+
+Several components were built on top of skills from the [ClawHub](https://clawhub.com) marketplace:
+
+- **Smart Reorder** uses the [instacart-skill](https://clawhub.com/skills/instacart-skill) by bigdaddyluke for browser-based Instacart cart building. We enhanced it with SQL-backed purchase cadence analysis and disabled auto-checkout.
+- **Card Wallet** merges our card-perks tracker with the [card-optimizer](https://clawhub.com/skills/card-optimizer) by scottfo. We unified the data store into SQLite (replacing the JSON file), added multi-holder support, and integrated quarterly management.
+- **Meal Planner** is based on the [meal-planner](https://clawhub.com/skills/meal-planner) by clawic. We rewired it to read from recipes.sqlite instead of markdown files and feed shopping lists into the Instacart pipeline instead of generating static lists.
 
 ---
 
@@ -250,7 +310,7 @@ cd ../flight-monitor
 # Set FLIGHTAWARE_API_KEY in env.sh
 # Install launchd plist (see flight-monitor/README.md)
 
-# 4. Add Email-to-Orders
+# 4. Add Email-to-Orders (now with shipment tracking)
 cd ../email-to-orders
 cat schemas/orders.sql | sqlite3 orders.sqlite
 # Add the email scan cron prompt to your OpenClaw cron jobs
@@ -261,24 +321,35 @@ cd ../instacart-orders
 # Add the daily scraper cron job (see SKILL.md for cron template)
 # Make sure the openclaw browser profile is logged into Instacart
 
-# 6. Add Places
+# 6. Add Smart Reorder (purchase cadence + item classification)
+cd ../smart-reorder
+# purchase-cadence.py and item-classify.py go in your orders infrastructure dir
+# The nightly scraper cron handles item classification automatically
+# Run a one-time backfill of Instacart order history for initial data
+
+# 7. Add Places
 cd ../places
 bash examples/setup.sh
 # Copy SKILL.md to your OpenClaw skills directory
 
-# 7. Add Destination-Aware Reminders
+# 8. Add Destination-Aware Reminders
 cd ../destination-aware
 # Configure HA_URL and HA_TOKEN in ~/.config/home-assistant/config.json
 # Set GOOGLE_PLACES_API_KEY for goplaces
-# Edit scripts/destination-daemon.py with your phone number
 # Install launchd plist (see shared/launchd/)
 
-# 8. Add Card Perks Tracker
-cd ../card-perks
+# 9. Add Card Wallet (benefits + purchase optimizer)
+cd ../card-wallet
 cat schemas/cards.sql | sqlite3 cards.sqlite
-# Seed your cards and benefits (see card-perks/schemas/cards.sql for schema)
-# Configure HOLDER_RECIPIENTS in card-perks-check.py or set env vars
-# Add Saturday + monthly cron jobs to OpenClaw
+# Seed your cards, benefits, and reward rates
+# Configure HOLDER_RECIPIENTS in card-wallet-check.py
+# Add Saturday + monthly + quarterly cron jobs to OpenClaw
+
+# 10. Add Meal Planner
+cd ../meal-planner
+# Copy SKILL.md + reference docs to your OpenClaw skills directory
+# Requires recipes.sqlite (from recipe-instacart skill) and Instacart skill
+# First use triggers household onboarding conversation
 ```
 
 ---
@@ -295,6 +366,8 @@ These add-ons are **infrastructure that runs outside of OpenClaw**:
 
 The LLM interacts with this infrastructure through CLIs (`outbox.py schedule`, `trip-db.py add-flight`) and SQL queries. But the infrastructure itself runs without the LLM.
 
+Where we do use LLMs in the pipeline: Flash classifies grocery item names into canonical products (semantic matching that regex can't do), and Haiku searches the web monthly for credit card benefit changes. These are genuinely interpretive tasks — not shell commands dressed up as agentTurns.
+
 ---
 
 ## Production Status
@@ -304,8 +377,9 @@ This system has been running in production for a household of 4 (2 adults, 2 kid
 - Daily morning briefings and evening digests for 2 adults
 - Email scanning across 4 accounts (2 Gmail, 2 Outlook)
 - Smart home control via Home Assistant
-- Grocery order tracking from Instacart and Amazon
+- Grocery order tracking with purchase cadence analysis across 5+ weekly Instacart orders
 - Destination-aware reminders via Tesla navigation + Google Places
+- Credit card benefit tracking across 6 cards, 14 benefits, and 24 reward rate categories
 
 The system handles ~20-30 messages/day through the outbox, costs ~$0.10-0.20/day in API calls, and has had zero missed message deliveries since the outbox pattern was implemented.
 

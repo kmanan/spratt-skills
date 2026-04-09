@@ -12,19 +12,26 @@ Usage (insert):
 Usage (update items on existing order):
     order-ingest.py update-items --source instacart --order-id ORD-123 \
         --items '[{"name":"Whole Milk","qty":2,"price":4.99}]' --total 14.97
+
+Usage (update tracking on existing order):
+    order-ingest.py update-tracking --source amazon --order-id 112-xxx \
+        --tracking 1Z999AA10123456784 [--carrier ups] [--status shipped] [--notify]
+    order-ingest.py update-tracking --source amazon --order-id 112-xxx \
+        --status delivered --notify
 """
 
 import argparse
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 ORDERS_DB = os.path.expanduser("~/.config/spratt/orders/orders.sqlite")
 OUTBOX_CLI = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.py")
-OWNER_PHONE = "+1XXXXXXXXXX"  # Replace with your phone number
+MANAN = "+1XXXXXXXXXX"  # Replace with your phone number
 
 
 def validate_items(items_str):
@@ -56,9 +63,9 @@ def cmd_insert(args):
             sys.exit(0)
 
     conn.execute(
-        "INSERT INTO orders (source, order_id, order_date, items, total, source_email_id, source_account) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (args.source, args.order_id, args.date, items_json, args.total, args.email_id, args.account)
+        "INSERT INTO orders (source, order_id, order_date, items, total, source_email_id, source_account, store) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (args.source, args.order_id, args.date, items_json, args.total, args.email_id, args.account, args.store)
     )
     conn.commit()
     order_db_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -74,7 +81,7 @@ def cmd_insert(args):
 
     if args.notify:
         status = args.delivery_status or "order received"
-        body = f"Order from {args.source.title()} — {status}. {item_count} items, {total_str}."
+        body = f"📦 {args.source.title()} — {status}. {item_count} items, {total_str}."
         if item_count <= 5:
             body += f"\n{item_names}"
 
@@ -83,7 +90,7 @@ def cmd_insert(args):
                 [
                     sys.executable, OUTBOX_CLI,
                     "schedule",
-                    "--to", OWNER_PHONE,
+                    "--to", MANAN,
                     "--body", body,
                     "--at", "now",
                     "--source", f"email-scan:{args.source}",
@@ -91,7 +98,7 @@ def cmd_insert(args):
                 ],
                 capture_output=True, text=True, timeout=10
             )
-            print(f"NOTIFIED: scheduled outbox message")
+            print(f"NOTIFIED: scheduled outbox message to Manan")
         except Exception as e:
             print(f"WARNING: notification failed: {e}", file=sys.stderr)
 
@@ -116,13 +123,107 @@ def cmd_update_items(args):
     if args.total is not None:
         updates.append("total = ?")
         params.append(args.total)
+    if args.store is not None:
+        updates.append("store = ?")
+        params.append(args.store)
     params.append(existing[0])
 
     conn.execute(f"UPDATE orders SET {', '.join(updates)} WHERE id = ?", params)
     conn.commit()
     conn.close()
 
-    print(f"OK: updated order {existing[0]} ({args.source}/{args.order_id}) — now {len(items)} items")
+    store_info = f", store={args.store}" if args.store else ""
+    print(f"OK: updated order {existing[0]} ({args.source}/{args.order_id}) — now {len(items)} items{store_info}")
+
+
+def detect_carrier(tracking):
+    """Auto-detect carrier from tracking number pattern."""
+    t = tracking.strip().upper()
+    if re.match(r'^1Z[A-Z0-9]{16}$', t):
+        return 'ups'
+    if re.match(r'^TBA\d{10,15}$', t):
+        return 'amazon'
+    if re.match(r'^9\d{15,21}$', t) or re.match(r'^[A-Z]{2}\d{9}US$', t):
+        return 'usps'
+    if re.match(r'^[CD]\d{14}$', t):
+        return 'ontrac'
+    if re.match(r'^(1LS|LX)', t):
+        return 'lasership'
+    if re.match(r'^JJD\d{18}$', t) or re.match(r'^\d{10}$', t):
+        return 'dhl'
+    if re.match(r'^\d{12,22}$', t):
+        return 'fedex'
+    return None
+
+
+STATUS_LABELS = {
+    "shipped": "Shipped",
+    "in_transit": "In Transit",
+    "out_for_delivery": "Out for Delivery",
+    "delivered": "Delivered",
+    "exception": "Delivery Exception",
+    "returned": "Returned to Sender",
+}
+
+
+def cmd_update_tracking(args):
+    """Update tracking number and/or delivery status on an existing order."""
+    conn = sqlite3.connect(ORDERS_DB)
+    existing = conn.execute(
+        "SELECT id, source, order_id, tracking_status FROM orders WHERE order_id = ? AND source = ?",
+        (args.order_id, args.source)
+    ).fetchone()
+
+    if not existing:
+        print(f"ERROR: no order found for order_id={args.order_id} source={args.source}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    order_db_id, source, order_id, old_status = existing
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    updates = ["tracking_updated_at = ?"]
+    params = [now]
+
+    if args.tracking:
+        updates.append("tracking_number = ?")
+        params.append(args.tracking)
+        carrier = args.carrier or detect_carrier(args.tracking)
+        if carrier:
+            updates.append("carrier = ?")
+            params.append(carrier)
+
+    status = args.status or ("shipped" if args.tracking else None)
+    if status:
+        updates.append("tracking_status = ?")
+        params.append(status)
+
+    params.append(order_db_id)
+    conn.execute(f"UPDATE orders SET {', '.join(updates)} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+
+    status_label = STATUS_LABELS.get(status, status) if status else "updated"
+    print(f"OK: tracking updated on order {order_db_id} ({source}/{order_id}) — {status_label}")
+
+    if args.notify and status:
+        body = f"📦 {source.title()} order {order_id}: {status_label}"
+        try:
+            subprocess.run(
+                [
+                    sys.executable, OUTBOX_CLI,
+                    "schedule",
+                    "--to", MANAN,
+                    "--body", body,
+                    "--at", "now",
+                    "--source", f"shipment:{source}:{order_id}",
+                    "--created-by", "order-ingest",
+                ],
+                capture_output=True, text=True, timeout=10
+            )
+            print(f"NOTIFIED: scheduled outbox message to Manan")
+        except Exception as e:
+            print(f"WARNING: notification failed: {e}", file=sys.stderr)
 
 
 def main():
@@ -139,6 +240,7 @@ def main():
     parser.add_argument("--account", default=None, help="Email account name")
     parser.add_argument("--notify", action="store_true", help="Send delivery notification")
     parser.add_argument("--delivery-status", default=None, help="e.g. 'delivered', 'arriving today'")
+    parser.add_argument("--store", default=None, help="Store name (e.g. qfc, costco, safeway)")
 
     # update-items subcommand
     update_parser = subparsers.add_parser("update-items", help="Update items on an existing order")
@@ -146,10 +248,22 @@ def main():
     update_parser.add_argument("--order-id", required=True, help="Vendor order ID")
     update_parser.add_argument("--items", required=True, help="JSON array of items")
     update_parser.add_argument("--total", type=float, default=None, help="Order total")
+    update_parser.add_argument("--store", default=None, help="Store name (e.g. qfc, costco)")
+
+    # update-tracking subcommand
+    track_parser = subparsers.add_parser("update-tracking", help="Update tracking info on an existing order")
+    track_parser.add_argument("--source", required=True, help="e.g. amazon, walmart, target")
+    track_parser.add_argument("--order-id", required=True, help="Vendor order ID")
+    track_parser.add_argument("--tracking", default=None, help="Tracking number")
+    track_parser.add_argument("--carrier", default=None, help="Carrier (auto-detected if omitted)")
+    track_parser.add_argument("--status", default=None, help="e.g. shipped, in_transit, out_for_delivery, delivered")
+    track_parser.add_argument("--notify", action="store_true", help="Send outbox notification for this update")
 
     args = parser.parse_args()
 
-    if args.command == "update-items":
+    if args.command == "update-tracking":
+        cmd_update_tracking(args)
+    elif args.command == "update-items":
         cmd_update_items(args)
     else:
         # Backwards-compatible insert mode
