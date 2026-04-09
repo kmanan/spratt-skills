@@ -27,6 +27,9 @@ OUTBOX_CLI = os.path.expanduser(
 )
 MANAN = "+1XXXXXXXXXX"  # Replace with your phone number
 ENTITY_ID = "sensor.maha_tesla_destination"
+STATE_FILE = os.path.expanduser(
+    "~/.config/spratt/infrastructure/destination/last-handled.json"
+)
 
 LOG_DIR = os.path.expanduser("~/Library/Logs/spratt")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -297,21 +300,39 @@ def main():
     ha_url, ha_token = load_ha_config()
     log.info(f"Starting destination daemon, watching {ENTITY_ID}")
 
-    # Check current state on startup — if a destination is already active, handle it
+    # Track last handled destination to avoid re-firing on restart
+    last_handled = None
+    try:
+        with open(STATE_FILE) as f:
+            last_handled = json.load(f).get("destination")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    # Check current state on startup — if a destination is active and not already handled
     current = get_current_state(ha_url, ha_token)
     log.info(f"Current destination state: {current}")
-    if current not in ("unknown", "unavailable", ""):
+    if current not in ("unknown", "unavailable", "") and current != last_handled:
         log.info(f"Destination already active on startup, processing: {current}")
         handle_destination(current, ha_url=ha_url, ha_token=ha_token)
+        with open(STATE_FILE, "w") as f:
+            json.dump({"destination": current}, f)
+    elif current == last_handled:
+        log.info(f"Destination {current} already handled, skipping")
 
     while True:
         try:
             log.info("Connecting to HA event stream...")
             for old_state, new_state in subscribe_sse(ha_url, ha_token):
-                if old_state == "unknown" and new_state not in ("unknown", "unavailable", ""):
+                if new_state not in ("unknown", "unavailable", "") and new_state != old_state:
                     handle_destination(new_state, ha_url=ha_url, ha_token=ha_token)
-                elif new_state == "unknown" and old_state not in ("unknown", "unavailable", ""):
+                    with open(STATE_FILE, "w") as f:
+                        json.dump({"destination": new_state}, f)
+                elif new_state in ("unknown", "unavailable") and old_state not in ("unknown", "unavailable", ""):
                     log.info("Navigation ended, destination cleared")
+                    try:
+                        os.remove(STATE_FILE)
+                    except FileNotFoundError:
+                        pass
 
         except KeyboardInterrupt:
             log.info("Shutting down")
