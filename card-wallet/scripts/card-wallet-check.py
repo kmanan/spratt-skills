@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Card Perks Saturday Check — deterministic, no LLM.
+Card Wallet Saturday Check — deterministic, no LLM.
 
-Runs weekly via exec cron. For each active, non-auto-applied benefit: ensures
-a usage row exists for the current period, then checks if any pending benefits
-expire within 10 days. If so, creates Apple Reminders and schedules an outbox
-message (one per holder). Sets notified_at to prevent duplicate notifications.
-
-Configuration:
-    Set CARDS_DB, OUTBOX_CLI, HOLDER_RECIPIENTS, and HOLDER_REMINDER_LIST
-    below to match your setup.
+Runs every Saturday at 9am via exec cron. For each active, non-auto-applied
+benefit: ensures a usage row exists for the current period, then checks if
+any pending benefits expire within 10 days. If so, creates Apple Reminders
+and schedules an outbox message (one per holder). Sets notified_at to prevent
+duplicate notifications on consecutive Saturdays.
 """
 
 import sqlite3
@@ -18,32 +15,23 @@ import sys
 import os
 from datetime import date, datetime, timedelta
 from calendar import monthrange
+from pathlib import Path
 
-# ── Configuration ────────────────────────────────────────────────────────────
-# Adjust these paths and mappings for your setup.
+CARDS_DB = os.path.expanduser("~/.config/spratt/cards/cards.sqlite")
+OUTBOX_CLI = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.py")
 
-CARDS_DB = os.environ.get(
-    "CARDS_DB",
-    os.path.expanduser("~/.config/spratt/cards/cards.sqlite"),
-)
-OUTBOX_CLI = os.environ.get(
-    "OUTBOX_CLI",
-    os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.py"),
-)
-
-# Map holder names (as stored in cards.holder) to phone numbers or chat GUIDs
+# Holder → recipient for outbox messages
 HOLDER_RECIPIENTS = {
-    "manan": os.environ.get("RECIPIENT_MANAN", "+1XXXXXXXXXX"),
-    "harshita": os.environ.get("RECIPIENT_HARSHITA", "+1XXXXXXXXXX"),
+    "holder1": "+1XXXXXXXXXX",  # Replace with your phone numbers
+    "holder2": "+1XXXXXXXXXX",
 }
 
-# Map holder names to Apple Reminders list names
+# Holder → Apple Reminders list name
 HOLDER_REMINDER_LIST = {
     "manan": "Manan",
     "harshita": "Harshita",
 }
 
-# ── Database ─────────────────────────────────────────────────────────────────
 
 def get_db():
     conn = sqlite3.connect(CARDS_DB)
@@ -52,8 +40,6 @@ def get_db():
     conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
-
-# ── Period Key Computation ───────────────────────────────────────────────────
 
 def current_period_key(cycle, period_rule, today):
     """Return the period key for a benefit given today's date."""
@@ -112,13 +98,12 @@ def chase_freedom_activation_deadline(today):
     return date(today.year, third_month, 14)
 
 
-# ── Expiration Logic ─────────────────────────────────────────────────────────
-
 def is_expiring_soon(benefit, today, days=10):
     """Check if a benefit expires within `days` days."""
     cycle = benefit["cycle"]
     period_rule = benefit["period_rule"]
 
+    # Chase Freedom activation has its own deadline
     if period_rule == "chase-freedom" and benefit["requires_activation"]:
         deadline = chase_freedom_activation_deadline(today)
         days_left = (deadline - today).days
@@ -153,14 +138,13 @@ def expiry_date_str(benefit, today):
     end = period_end_date(benefit["cycle"], benefit["period_rule"], today)
     if end is None:
         return "?"
+    # Show "resets" as the day after period end
     reset = end + timedelta(days=1)
     return reset.strftime("%b %-d")
 
 
-# ── Pending Rows ─────────────────────────────────────────────────────────────
-
 def ensure_pending_rows(conn, today):
-    """For each active, non-auto-applied benefit, ensure a usage row exists."""
+    """For each active, non-auto-applied benefit, ensure a usage row exists for the current period."""
     benefits = conn.execute("""
         SELECT b.id, b.cycle, b.period_rule
         FROM benefits b
@@ -217,8 +201,6 @@ def get_expiring_benefits(conn, today):
     return expiring
 
 
-# ── Message Formatting ───────────────────────────────────────────────────────
-
 def format_benefit_line(b, today):
     """Format a single benefit for the outbox message."""
     days = days_until_expiry(b, today)
@@ -227,31 +209,10 @@ def format_benefit_line(b, today):
 
     if b["period_rule"] == "chase-freedom" and b["requires_activation"]:
         cats = b["notes"] or "check chase.com"
-        return f"  \u26a1 {b['card_name']} 5% \u2014 activate by {exp_str} ({cats})"
+        return f"  ⚡ {b['card_name']} 5% — activate by {exp_str} ({cats})"
 
-    return f"  \U0001f4b8 {card_short} {b['name']} \u2014 ${b['amount']:.0f} unclaimed ({days} days until {exp_str})"
+    return f"  💸 {card_short} {b['name']} — ${b['amount']:.0f} unclaimed ({days} days until {exp_str})"
 
-
-def build_message(holder, benefits, today):
-    """Build the full notification message for a holder."""
-    n = len(benefits)
-    # Customize the address — adapt this to your household
-    address = "sir" if holder == "manan" else "ma'am"
-
-    if n == 1:
-        opener = f"\U0001f9e4 If I may, {address} \u2014 one card benefit requires your attention before it vanishes into the ether:"
-    else:
-        opener = f"\U0001f9e4 A gentle reminder, {address} \u2014 {n} card benefits are expiring shortly and remain unclaimed:"
-
-    lines = [opener, ""]
-    for b in benefits:
-        lines.append(format_benefit_line(b, today))
-    lines.append("")
-    lines.append('A simple "used [name]" will do. I shall attend to the rest.')
-    return "\n".join(lines)
-
-
-# ── Apple Reminders ──────────────────────────────────────────────────────────
 
 def create_reminder(benefit, today, holder):
     """Create an Apple Reminder for an expiring benefit."""
@@ -259,13 +220,13 @@ def create_reminder(benefit, today, holder):
 
     if benefit["period_rule"] == "chase-freedom" and benefit["requires_activation"]:
         deadline = chase_freedom_activation_deadline(today)
-        title = f"Activate Chase Freedom 5% \u2014 deadline {deadline.strftime('%b %-d')}"
+        title = f"Activate Chase Freedom 5% — deadline {deadline.strftime('%b %-d')}"
         due = deadline.strftime("%Y-%m-%d")
     else:
         end = period_end_date(benefit["cycle"], benefit["period_rule"], today)
         if end is None:
             return
-        title = f"Use {benefit['name']} (${benefit['amount']:.0f}) \u2014 expires {(end + timedelta(days=1)).strftime('%b %-d')}"
+        title = f"Use {benefit['name']} (${benefit['amount']:.0f}) — expires {(end + timedelta(days=1)).strftime('%b %-d')}"
         due = end.strftime("%Y-%m-%d")
 
     try:
@@ -277,13 +238,11 @@ def create_reminder(benefit, today, holder):
         print(f"Warning: failed to create reminder: {e}", file=sys.stderr)
 
 
-# ── Outbox ───────────────────────────────────────────────────────────────────
-
 def schedule_outbox(holder, message):
     """Schedule an outbox message for a holder."""
     recipient = HOLDER_RECIPIENTS.get(holder)
-    if not recipient or recipient == "+1XXXXXXXXXX":
-        print(f"Warning: no recipient configured for holder '{holder}'", file=sys.stderr)
+    if not recipient:
+        print(f"Warning: no recipient for holder '{holder}'", file=sys.stderr)
         return
 
     try:
@@ -294,8 +253,8 @@ def schedule_outbox(holder, message):
                 "--to", recipient,
                 "--body", message,
                 "--at", "now",
-                "--source", "card-perks:saturday",
-                "--created-by", "card-perks-check",
+                "--source", "card-wallet:saturday",
+                "--created-by", "card-wallet-check",
             ],
             capture_output=True, text=True, timeout=10
         )
@@ -314,8 +273,6 @@ def mark_notified(conn, usage_ids):
     conn.commit()
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-
 def main():
     today = date.today()
     conn = get_db()
@@ -327,16 +284,33 @@ def main():
     expiring = get_expiring_benefits(conn, today)
 
     if not expiring:
+        # Silent Saturday — nothing to do
         return
 
     # Step 3: for each holder, create reminders + outbox message
     for holder, benefits in expiring.items():
-        message = build_message(holder, benefits, today)
+        # Build message — Spratt's voice
+        n = len(benefits)
+        address = "sir" if holder == "manan" else "ma'am"
+        if n == 1:
+            opener = f"🧤 If I may, {address} — one card benefit requires your attention before it vanishes into the ether:"
+        else:
+            opener = f"🧤 A gentle reminder, {address} — {n} card benefits are expiring shortly and remain unclaimed:"
+        lines = [opener, ""]
+        for b in benefits:
+            lines.append(format_benefit_line(b, today))
+        lines.append("")
+        lines.append("A simple \"used [name]\" will do. I shall attend to the rest.")
+        message = "\n".join(lines)
+
+        # Schedule outbox
         schedule_outbox(holder, message)
 
+        # Create Apple Reminders
         for b in benefits:
             create_reminder(b, today, holder)
 
+        # Mark as notified
         usage_ids = [b["usage_id"] for b in benefits]
         mark_notified(conn, usage_ids)
 

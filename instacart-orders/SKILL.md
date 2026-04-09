@@ -7,7 +7,7 @@ version: 1.0.0
 # Instacart Order Scraping
 
 Extracts full itemized order details from Instacart via browser automation.
-Instacart confirmation emails rarely contain item lists — this skill fills them in by scraping the Instacart account directly.
+The email scanner detects Instacart orders but emails rarely contain item lists — this skill fills them in by scraping the Instacart account.
 
 ## When to use
 
@@ -65,7 +65,7 @@ Build a JSON array from the receipt. Each item:
 [
   {"name": "Cilantro Bunch", "qty": 1, "price": 1.49},
   {"name": "Simply Pulp Free Orange Juice Bottles", "qty": 1, "price": 7.99},
-  {"name": "LaCroix Sparkling Water Orange", "qty": 2, "price": 8.58}
+  {"name": "LaCroix Sparkling Water, Orange", "qty": 2, "price": 8.58}
 ]
 ```
 
@@ -82,8 +82,11 @@ python3 ~/.config/spratt/infrastructure/orders/order-ingest.py update-items \
   --source instacart \
   --order-id "ORDER_ID" \
   --items 'JSON_ARRAY' \
-  --total TOTAL
+  --total TOTAL \
+  --store STORE_NAME
 ```
+
+**Always include `--store`** (e.g. `qfc`, `costco`, `safeway`). The store name is visible on the order list and detail pages. This powers the purchase cadence analysis for smart reordering.
 
 If the order doesn't exist yet (backfill), use insert mode:
 
@@ -93,7 +96,8 @@ python3 ~/.config/spratt/infrastructure/orders/order-ingest.py \
   --order-id "ORDER_ID" \
   --date "YYYY-MM-DD" \
   --items 'JSON_ARRAY' \
-  --total TOTAL
+  --total TOTAL \
+  --store STORE_NAME
 ```
 
 ## Step 6: Confirm
