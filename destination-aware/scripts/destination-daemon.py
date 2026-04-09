@@ -64,7 +64,14 @@ def get_current_state(ha_url, ha_token):
 
 
 def subscribe_sse(ha_url, ha_token):
-    """Subscribe to HA event stream, yield state_changed events for our entity."""
+    """Subscribe to HA event stream, yield state_changed events for our entity.
+
+    HA sends ping events every ~30s. If no data arrives for 120s,
+    the connection is considered dead and we raise to trigger reconnect.
+    """
+    import socket
+    import select
+
     req = urllib.request.Request(
         f"{ha_url}/api/stream",
         headers={
@@ -72,12 +79,35 @@ def subscribe_sse(ha_url, ha_token):
             "Accept": "text/event-stream",
         },
     )
-    resp = urllib.request.urlopen(req, timeout=None)
+    resp = urllib.request.urlopen(req, timeout=30)
+    sock = resp.fp.raw._sock if hasattr(resp.fp, 'raw') else None
+    if sock:
+        sock.setblocking(False)
 
     buffer = ""
     event_type = None
+    last_data_time = time.time()
 
-    for raw_line in resp:
+    while True:
+        # Check for stale connection (no data in 120s)
+        if time.time() - last_data_time > 120:
+            raise ConnectionError("SSE stream stale — no data for 120s")
+
+        # Use select for timeout-aware reading
+        if sock:
+            ready, _, _ = select.select([sock], [], [], 30)
+            if not ready:
+                continue
+
+        try:
+            raw_line = resp.readline()
+        except (socket.error, OSError):
+            raise ConnectionError("SSE read error")
+
+        if not raw_line:
+            raise ConnectionError("SSE stream closed by server")
+
+        last_data_time = time.time()
         line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
 
         if line.startswith("event:"):
@@ -85,7 +115,6 @@ def subscribe_sse(ha_url, ha_token):
         elif line.startswith("data:"):
             buffer += line[5:].strip()
         elif line == "":
-            # End of event
             if event_type == "state_changed" and buffer:
                 try:
                     data = json.loads(buffer)
@@ -100,14 +129,20 @@ def subscribe_sse(ha_url, ha_token):
             event_type = None
 
 
-def gather_context(destination):
+def gather_context(destination, lat=None, lng=None):
     """Run destination-context.py and return parsed JSON."""
     try:
+        cmd = ["/usr/bin/python3", CONTEXT_SCRIPT, "--destination", destination]
+        if lat and lng:
+            cmd.extend(["--lat", str(lat), "--lng", str(lng)])
+        env = os.environ.copy()
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         r = subprocess.run(
-            [sys.executable, CONTEXT_SCRIPT, "--destination", destination],
+            cmd,
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
         if r.returncode != 0:
             log.error(f"Context script failed: {r.stderr}")
@@ -192,7 +227,7 @@ def send_notification(message):
     try:
         subprocess.run(
             [
-                sys.executable,
+                "/usr/bin/python3",
                 OUTBOX_CLI,
                 "schedule",
                 "--to", MANAN,
@@ -210,11 +245,37 @@ def send_notification(message):
         log.error(f"Notification failed: {e}")
 
 
-def handle_destination(destination):
+def get_destination_coords(ha_url, ha_token):
+    """Get destination coordinates from Tesla route tracker."""
+    try:
+        req = urllib.request.Request(
+            f"{ha_url}/api/states/device_tracker.maha_tesla_route",
+            headers={"Authorization": f"Bearer {ha_token}"},
+        )
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read())
+        attrs = data.get("attributes", {})
+        lat = attrs.get("latitude")
+        lng = attrs.get("longitude")
+        if lat and lng:
+            return float(lat), float(lng)
+    except Exception as e:
+        log.warning(f"Could not get destination coords: {e}")
+    return None, None
+
+
+def handle_destination(destination, ha_url=None, ha_token=None):
     """Full pipeline: gather context → compose → send."""
     log.info(f"Destination set: {destination}")
 
-    context = gather_context(destination)
+    # Get destination coordinates for location-biased search
+    lat, lng = None, None
+    if ha_url and ha_token:
+        lat, lng = get_destination_coords(ha_url, ha_token)
+        if lat:
+            log.info(f"Destination coords: {lat}, {lng}")
+
+    context = gather_context(destination, lat=lat, lng=lng)
     if not context:
         log.info("No context gathered, skipping")
         return
@@ -236,16 +297,19 @@ def main():
     ha_url, ha_token = load_ha_config()
     log.info(f"Starting destination daemon, watching {ENTITY_ID}")
 
-    # Check current state on startup
+    # Check current state on startup — if a destination is already active, handle it
     current = get_current_state(ha_url, ha_token)
     log.info(f"Current destination state: {current}")
+    if current not in ("unknown", "unavailable", ""):
+        log.info(f"Destination already active on startup, processing: {current}")
+        handle_destination(current, ha_url=ha_url, ha_token=ha_token)
 
     while True:
         try:
             log.info("Connecting to HA event stream...")
             for old_state, new_state in subscribe_sse(ha_url, ha_token):
                 if old_state == "unknown" and new_state not in ("unknown", "unavailable", ""):
-                    handle_destination(new_state)
+                    handle_destination(new_state, ha_url=ha_url, ha_token=ha_token)
                 elif new_state == "unknown" and old_state not in ("unknown", "unavailable", ""):
                     log.info("Navigation ended, destination cleared")
 

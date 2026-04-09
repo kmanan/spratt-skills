@@ -124,7 +124,7 @@ When you set a destination in your Tesla, this daemon detects it via Home Assist
 | **Dependencies** | Python 3, Home Assistant with Tesla integration, [goplaces](https://github.com/openclaw/goplaces) CLI (Google Places API), Outbox (above) |
 | **Schedule** | Persistent daemon. Reacts instantly when Tesla nav destination is set. Zero polling. |
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
-| **Setup time** | ~10 minutes (after Outbox is set up) |
+| **Setup time** | ~10 minutes (after Outbox is set up). See [destination-aware/README.md](./destination-aware/README.md) for deployment gotchas. |
 
 ### 9. [Card Perks](./card-perks/) — Credit Card Benefits Tracker
 
