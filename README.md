@@ -88,7 +88,7 @@ Instacart confirmation emails don't contain itemized order details — they just
 
 Analyzes your grocery purchase history to predict when you'll need to reorder each item. Calculates median days between purchases per product, flags items that are due or coming up soon. An LLM (Flash) classifies receipt item names into canonical products — so "QFC Vitamin D Whole Milk Half Gallon" and "QFC Vitamin D Whole Milk" are recognized as the same thing, while "Organic Valley Whole Milk" stays separate (different brand).
 
-Feeds into the [Instacart ordering skill](https://clawhub.com/skills/instacart-skill) (from ClawHub, by bigdaddyluke) for cart building.
+Feeds into the [Instacart Skill](./instacart-skill/) (below) for cart building.
 
 **Why it exists:** "We're out of milk again" shouldn't require remembering. The system knows you buy milk every 7 days and your last order was 8 days ago.
 
@@ -100,7 +100,21 @@ Feeds into the [Instacart ordering skill](https://clawhub.com/skills/instacart-s
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes (after Instacart Orders is set up) |
 
-### 7. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
+### 7. [Instacart Skill](./instacart-skill/) — Browser-Based Grocery Cart Building
+
+Drives a browser to build grocery carts on Instacart. The LLM searches products, adds items, handles quantity adjustments, and presents a cart summary — but never places the order. Originally from [instacart-skill](https://clawhub.com/skills/instacart-skill) on ClawHub (by bigdaddyluke), heavily customized with URL-based search (Instacart's search input doesn't work with Playwright), snapshot-first browser interaction rules, smart lookback integration via purchase cadence analysis, and automated browser crash recovery.
+
+**Why it exists:** Typing grocery lists into Instacart is tedious. "We need groceries" should result in a pre-built cart based on what you usually buy and what's due for reorder. The skill bridges the gap between the smart reorder analysis and the actual Instacart cart.
+
+| | |
+|---|---|
+| **What you get** | SKILL.md (browser automation instructions with URL-based search, login flow, cart building, smart replenishment mode) |
+| **Dependencies** | OpenClaw browser tool, an active Instacart account, Smart Reorder (above) for purchase cadence data, `gog` CLI for login verification codes |
+| **Schedule** | N/A — interactive skill, invoked on demand or by smart replenishment automation. |
+| **macOS-specific** | No |
+| **Setup time** | ~5 minutes (after Smart Reorder is set up). Log into Instacart once in the `openclaw` browser profile. |
+
+### 8. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
 
 Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft Graph API. Multi-account OAuth2 with auto-refreshing tokens. Calendar events support descriptions, attendees, and multi-calendar targeting — create a family appointment on the "For Family" calendar with attendees and notes in one command.
 
@@ -114,7 +128,7 @@ Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft 
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
-### 8. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
+### 9. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
 
 A SQLite database for places you want to remember — restaurants, bars, activities, attractions. Share an Instagram post, Google Maps link, Yelp page, or just say "remember that Thai place on Queen West" and it gets saved with category, cuisine, location, tags, and notes. Query by vibe ("date night spots"), location, cuisine, or who saved it. Track visits and ratings.
 
@@ -128,7 +142,7 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes |
 
-### 9. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
+### 10. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
 
 When you set a destination in your Tesla, this daemon detects it via Home Assistant's SSE stream and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know.
 
@@ -142,7 +156,7 @@ When you set a destination in your Tesla, this daemon detects it via Home Assist
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~10 minutes (after Outbox is set up). See [destination-aware/README.md](./destination-aware/README.md) for deployment gotchas. |
 
-### 10. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
+### 11. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
 
 Merged skill that tracks both **"use it or lose it" credit card benefits** (monthly credits, quarterly categories, semi-annual windows) and **per-purchase reward optimization** ("which card for groceries?"). A weekly cron checks expiring benefits and notifies each cardholder. A monthly LLM-powered refresh searches the web for benefit and reward rate changes. Interactive queries recommend the optimal card per spending category with cap awareness and network acceptance warnings (Amex fallbacks).
 
@@ -156,7 +170,7 @@ Merged skill that tracks both **"use it or lose it" credit card benefits** (mont
 | **macOS-specific** | Apple Reminders via remindctl (optional — remove reminder creation for Linux) |
 | **Setup time** | ~10 minutes (after Outbox is set up) |
 
-### 11. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
+### 12. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
 
 Weekly meal planning that reads from your recipe database, checks pantry inventory, and generates shopping lists that feed directly into the Instacart ordering pipeline. Handles dietary restrictions, household coordination (adults vs kids), batch cooking, and budget tracking. Based on the [meal-planner](https://clawhub.com/skills/meal-planner) skill from ClawHub (by clawic), adapted to use SQLite-backed recipes and the Instacart skill instead of standalone markdown files.
 
@@ -170,7 +184,7 @@ Weekly meal planning that reads from your recipe database, checks pantry invento
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes + first-use household onboarding conversation |
 
-### 12. [Apple Reminders — Recurring](./apple-reminders/) — Recurring Reminder Support
+### 13. [Apple Reminders — Recurring](./apple-reminders/) — Recurring Reminder Support
 
 A compiled Swift binary that creates proper recurring Apple Reminders via EventKit. The `remindctl` CLI doesn't support recurrence, so without this, the LLM creates individual copies for each occurrence — fragile and cluttered.
 
@@ -267,7 +281,8 @@ Human → "which card for dining?"
 
 Several components were built on top of skills from the [ClawHub](https://clawhub.com) marketplace:
 
-- **Smart Reorder** uses the [instacart-skill](https://clawhub.com/skills/instacart-skill) by bigdaddyluke for browser-based Instacart cart building. We enhanced it with SQL-backed purchase cadence analysis and disabled auto-checkout.
+- **Instacart Skill** is forked from [instacart-skill](https://clawhub.com/skills/instacart-skill) by bigdaddyluke. We replaced search-box typing with URL-based search (Instacart's search input doesn't work with Playwright), added snapshot-first browser interaction rules, integrated smart lookback via purchase cadence analysis, and added browser crash self-recovery. Auto-checkout is disabled.
+- **Smart Reorder** feeds into the Instacart Skill (above) for cart building. We added SQL-backed purchase cadence analysis and LLM item classification.
 - **Card Wallet** merges our card-perks tracker with the [card-optimizer](https://clawhub.com/skills/card-optimizer) by scottfo. We unified the data store into SQLite (replacing the JSON file), added multi-holder support, and integrated quarterly management.
 - **Meal Planner** is based on the [meal-planner](https://clawhub.com/skills/meal-planner) by clawic. We rewired it to read from recipes.sqlite instead of markdown files and feed shopping lists into the Instacart pipeline instead of generating static lists.
 
@@ -327,25 +342,32 @@ cd ../smart-reorder
 # The nightly scraper cron handles item classification automatically
 # Run a one-time backfill of Instacart order history for initial data
 
-# 7. Add Places
+# 7. Add Instacart Skill (browser-based cart building)
+cd ../instacart-skill
+# Copy SKILL.md to your OpenClaw skills directory
+# Log into Instacart once in the openclaw browser profile
+# Create memory/instacart-storefronts.json with your store slug mappings
+# Set INSTACART_URL, INSTACART_EMAIL in your agent's env file
+
+# 8. Add Places
 cd ../places
 bash examples/setup.sh
 # Copy SKILL.md to your OpenClaw skills directory
 
-# 8. Add Destination-Aware Reminders
+# 9. Add Destination-Aware Reminders
 cd ../destination-aware
 # Configure HA_URL and HA_TOKEN in ~/.config/home-assistant/config.json
 # Set GOOGLE_PLACES_API_KEY for goplaces
 # Install launchd plist (see shared/launchd/)
 
-# 9. Add Card Wallet (benefits + purchase optimizer)
+# 10. Add Card Wallet (benefits + purchase optimizer)
 cd ../card-wallet
 cat schemas/cards.sql | sqlite3 cards.sqlite
 # Seed your cards, benefits, and reward rates
 # Configure HOLDER_RECIPIENTS in card-wallet-check.py
 # Add Saturday + monthly + quarterly cron jobs to OpenClaw
 
-# 10. Add Meal Planner
+# 11. Add Meal Planner
 cd ../meal-planner
 # Copy SKILL.md + reference docs to your OpenClaw skills directory
 # Requires recipes.sqlite (from recipe-instacart skill) and Instacart skill
