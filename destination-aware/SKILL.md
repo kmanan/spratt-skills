@@ -60,7 +60,7 @@ Only if there is relevant context to share:
 
 ```bash
 python3 ~/.config/spratt/infrastructure/outbox/outbox.py schedule \
-  --to "+15551234567" \
+  --to "Manan" \
   --body "MESSAGE" \
   --at now \
   --source "destination-aware" \

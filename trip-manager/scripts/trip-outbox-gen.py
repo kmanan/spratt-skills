@@ -29,15 +29,83 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-# --- Config ---
+# ─── Config ───
 
 TRIPS_DB = os.path.expanduser("~/.config/spratt/trips/trips.sqlite")
 OUTBOX_DB = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.sqlite")
 LOG_FILE = os.path.expanduser("~/Library/Logs/spratt/trip-outbox-gen.log")
 UBER_BASE = "https://m.uber.com/ul/?action=setPickup&pickup=my_location"
-OWNER_PHONE = "+1XXXXXXXXXX"  # Replace with your phone number
+MANAN_PHONE = "Manan"  # resolved by outbox.py via contacts.sqlite
 
-# --- Logging ---
+
+def require_db_file(path, name):
+    """Fail loudly if a SQLite DB file doesn't exist where expected.
+    Prevents silent split-brain from path resolution bugs that would otherwise
+    cause sqlite3.connect() to create an empty new DB at the wrong path.
+    """
+    if not os.path.exists(path):
+        sys.stderr.write(
+            f"\nFATAL: {name} database not found at:\n    {path}\n\n"
+            f"Refusing to auto-create (prevents silent data loss if the path is wrong).\n\n"
+        )
+        sys.exit(1)
+
+# IATA airport code → IANA timezone (for rendering departure times in local time).
+# Covers every airport referenced in current trips. Extend as needed.
+AIRPORT_TZ = {
+    "SEA": "America/Los_Angeles", "SFO": "America/Los_Angeles", "LAX": "America/Los_Angeles",
+    "PDX": "America/Los_Angeles", "SAN": "America/Los_Angeles", "SMF": "America/Los_Angeles",
+    "JFK": "America/New_York", "LGA": "America/New_York", "EWR": "America/New_York",
+    "DCA": "America/New_York", "IAD": "America/New_York", "BWI": "America/New_York",
+    "BOS": "America/New_York", "PHL": "America/New_York", "ATL": "America/New_York",
+    "MIA": "America/New_York", "FLL": "America/New_York", "MCO": "America/New_York",
+    "ORD": "America/Chicago", "MDW": "America/Chicago", "DFW": "America/Chicago",
+    "IAH": "America/Chicago", "AUS": "America/Chicago", "MSP": "America/Chicago",
+    "DEN": "America/Denver", "PHX": "America/Phoenix", "SLC": "America/Denver",
+    "HNL": "Pacific/Honolulu",
+    "BOM": "Asia/Kolkata", "DEL": "Asia/Kolkata", "BLR": "Asia/Kolkata",
+    "LHR": "Europe/London", "CDG": "Europe/Paris", "FRA": "Europe/Berlin",
+    "NRT": "Asia/Tokyo", "HND": "Asia/Tokyo", "ICN": "Asia/Seoul",
+}
+
+
+def format_departure(departs_utc, origin_iata):
+    """Render a departs_utc ISO string as human-readable local time at the origin airport.
+
+    Example: "10:55 PM PT · Sun, Apr 19" for '2026-04-19T22:55:00-07:00' at SEA.
+    Falls back to raw ISO only if the timestamp can't be parsed (shouldn't happen).
+    """
+    if not departs_utc:
+        return "time TBD"
+    try:
+        dt = datetime.fromisoformat(departs_utc.replace("Z", "+00:00"))
+    except Exception:
+        return departs_utc  # unparseable → fall through rather than drop
+
+    # Re-express in the origin airport's local timezone when known.
+    tz_name = AIRPORT_TZ.get((origin_iata or "").upper())
+    if tz_name:
+        try:
+            dt = dt.astimezone(ZoneInfo(tz_name))
+            tz_abbr = dt.strftime("%Z") or ""
+            # %Z can return "PDT"/"PST" etc; collapse to "PT"/"ET" for conversational feel
+            short = {
+                "PDT": "PT", "PST": "PT",
+                "EDT": "ET", "EST": "ET",
+                "CDT": "CT", "CST": "CT",
+                "MDT": "MT", "MST": "MT",
+                "HDT": "HT", "HST": "HT",
+            }.get(tz_abbr, tz_abbr)
+            time_part = dt.strftime("%-I:%M %p").lstrip("0")
+            date_part = dt.strftime("%a, %b %-d")
+            return f"{time_part} {short} · {date_part}".strip().rstrip("·").strip()
+        except Exception:
+            pass
+
+    # No tz map match — render in whatever offset the ISO carried.
+    return dt.strftime("%-I:%M %p · %a, %b %-d")
+
+# ─── Logging ───
 
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 logging.basicConfig(
@@ -51,7 +119,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# --- Helpers ---
+# ─── Helpers ───
 
 def uber_link(address):
     """Generate Uber deep link for an address."""
@@ -89,7 +157,7 @@ def compute_send_time_local(date_str, time_str, hours_before, tz_name):
 def get_recipient(trips_conn, trip_id):
     """Determine message recipient for a trip.
 
-    Priority: group_chat_guid > first traveler phone > owner fallback.
+    Priority: group_chat_guid > first traveler phone > Manan fallback.
     """
     trip = trips_conn.execute(
         "SELECT group_chat_guid FROM trips WHERE id = ?", (trip_id,)
@@ -105,7 +173,7 @@ def get_recipient(trips_conn, trip_id):
     if traveler and traveler["phone"]:
         return traveler["phone"]
 
-    return OWNER_PHONE
+    return MANAN_PHONE
 
 
 def create_outbox_message(recipient, body, send_at_utc, source, trip_id, dry_run=False):
@@ -115,6 +183,7 @@ def create_outbox_message(recipient, body, send_at_utc, source, trip_id, dry_run
         log.info(f"  body: {body[:120]}...")
         return -1
 
+    require_db_file(OUTBOX_DB, "outbox")
     outbox_conn = sqlite3.connect(OUTBOX_DB)
     cur = outbox_conn.execute(
         "INSERT INTO messages (recipient, body, send_at, source, created_by, trip_id) VALUES (?, ?, ?, ?, ?, ?)",
@@ -126,10 +195,11 @@ def create_outbox_message(recipient, body, send_at_utc, source, trip_id, dry_run
     return msg_id
 
 
-# --- Generation ---
+# ─── Generation ───
 
 def generate_for_trip(trip_id, dry_run=False):
     """Generate outbox messages for a single trip. Returns count generated."""
+    require_db_file(TRIPS_DB, "trips")
     conn = sqlite3.connect(TRIPS_DB)
     conn.row_factory = sqlite3.Row
 
@@ -151,7 +221,7 @@ def generate_for_trip(trip_id, dry_run=False):
     recipient = get_recipient(conn, trip_id)
     generated = 0
 
-    # --- Flights without outbox messages ---
+    # ─── Flights without outbox messages ───
     flights = conn.execute(
         "SELECT id, traveler, flight_number, route, departs_utc, arrives_utc "
         "FROM flights WHERE trip_id = ? AND status = 'scheduled' AND outbox_msg_id IS NULL",
@@ -164,14 +234,24 @@ def generate_for_trip(trip_id, dry_run=False):
             log.warning(f"Flight {f['flight_number']}: no departure time, skipping outbox")
             continue
 
-        # Departure airport from route
+        # Departure airport from route ("EWR → SEA" → "EWR")
         airport = ""
-        if f["route"] and "\u2192" in f["route"]:
-            airport = f["route"].split("\u2192")[0].strip()
+        if f["route"] and "→" in f["route"]:
+            airport = f["route"].split("→")[0].strip()
 
-        body = f"\u2708\ufe0f {f['traveler'] or 'Flight'} \u2014 {f['flight_number']} {f['route'] or ''} departs {f['departs_utc'] or 'TBD'}."
+        # Human-readable departure time in the origin airport's local timezone.
+        # Message fires 3h before departure, so "in ~3 hours" gives the reader
+        # an immediate sense of urgency on top of the absolute local time.
+        departure_str = format_departure(f["departs_utc"], airport)
+        traveler = f["traveler"] or "Flight"
+        flight_num = f["flight_number"]
+        route = f["route"] or ""
+        body = (
+            f"✈️ {traveler} — {flight_num} {route}\n"
+            f"Departs {departure_str} (in ~3 hours)."
+        )
         if airport:
-            body += f"\n\ud83d\ude97 Uber to {airport}: {uber_link(airport + ' Airport')}"
+            body += f"\n🚗 Uber to {airport}: {uber_link(airport + ' Airport')}"
 
         source = f"trip:{trip_id}:flight:{f['flight_number']}"
         msg_id = create_outbox_message(recipient, body, send_at, source, trip_id, dry_run)
@@ -184,7 +264,7 @@ def generate_for_trip(trip_id, dry_run=False):
         log.info(f"outbox [{msg_id}] created for flight {f['flight_number']}")
         generated += 1
 
-    # --- Hotels without outbox messages ---
+    # ─── Hotels without outbox messages ───
     hotels = conn.execute(
         "SELECT id, name, address, check_in "
         "FROM hotels WHERE trip_id = ? AND outbox_msg_id IS NULL",
@@ -198,9 +278,9 @@ def generate_for_trip(trip_id, dry_run=False):
         if not send_at:
             continue
 
-        body = f"\ud83c\udfe8 Checking in to {h['name'] or 'hotel'} today."
+        body = f"🏨 Checking in to {h['name'] or 'hotel'} today."
         if h["address"]:
-            body += f"\n\ud83d\udccd {h['address']}\n\ud83d\ude97 Uber: {uber_link(h['address'])}"
+            body += f"\n📍 {h['address']}\n🚗 Uber: {uber_link(h['address'])}"
 
         source = f"trip:{trip_id}:hotel:{h['name'] or 'hotel'}"
         msg_id = create_outbox_message(recipient, body, send_at, source, trip_id, dry_run)
@@ -213,7 +293,7 @@ def generate_for_trip(trip_id, dry_run=False):
         log.info(f"outbox [{msg_id}] created for hotel {h['name']}")
         generated += 1
 
-    # --- Reservations without outbox messages ---
+    # ─── Reservations without outbox messages ───
     reservations = conn.execute(
         "SELECT id, type, name, date, time, address, notes "
         "FROM reservations WHERE trip_id = ? AND outbox_msg_id IS NULL",
@@ -232,10 +312,10 @@ def generate_for_trip(trip_id, dry_run=False):
         if not send_at:
             continue
 
-        emoji = {"dinner": "\ud83c\udf7d", "brunch": "\ud83e\udd42", "lunch": "\ud83c\udf7d", "activity": "\ud83c\udfaf", "tour": "\ud83d\uddfa", "show": "\ud83c\udfad", "event": "\ud83d\udccd"}.get(r["type"], "\ud83d\udccd")
+        emoji = {"dinner": "🍽", "brunch": "🥂", "lunch": "🍽", "activity": "🎯", "tour": "🗺", "show": "🎭", "event": "📍"}.get(r["type"], "📍")
         body = f"{emoji} {r['type'].title()} at {r['name']}, {r['time']}."
         if r["address"]:
-            body += f"\n\ud83d\udccd {r['address']}\n\ud83d\ude97 Uber: {uber_link(r['address'])}"
+            body += f"\n📍 {r['address']}\n🚗 Uber: {uber_link(r['address'])}"
 
         source = f"trip:{trip_id}:reservation:{r['name']}"
         msg_id = create_outbox_message(recipient, body, send_at, source, trip_id, dry_run)
@@ -255,7 +335,7 @@ def generate_for_trip(trip_id, dry_run=False):
     return generated
 
 
-# --- Main ---
+# ─── Main ───
 
 def main():
     if len(sys.argv) < 2:
@@ -272,6 +352,7 @@ def main():
             sys.exit(1)
         trip_id = sys.argv[2]
     elif sys.argv[1] == "--all":
+        require_db_file(TRIPS_DB, "trips")
         conn = sqlite3.connect(TRIPS_DB)
         conn.row_factory = sqlite3.Row
         trips = conn.execute(

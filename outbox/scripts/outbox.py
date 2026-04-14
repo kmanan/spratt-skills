@@ -8,7 +8,7 @@ the only thing that actually calls imsg.
 
 CLI Usage:
   outbox.py schedule --to "9" --body "Dinner at 7:30" --at "2026-04-02T20:00:00Z" --source "trip:dc"
-  outbox.py schedule --to "+1XXXXXXXXXX" --body "Landed!" --at now --source "flight:AS3" --priority 10
+  outbox.py schedule --to "Manan" --body "Landed!" --at now --source "flight:AS3" --priority 10
   outbox.py cancel --source "trip:dc"
   outbox.py cancel --id 42
   outbox.py update --id 42 --body "New text"
@@ -36,6 +36,103 @@ from datetime import datetime, timezone, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "outbox.sqlite")
 
+
+def require_db_file(path, name):
+    """Fail loudly if a SQLite DB file doesn't exist where expected.
+
+    Prevents silent split-brain from path resolution bugs (stale symlinks,
+    moved files) that would otherwise cause sqlite3.connect() to create an
+    empty new DB at the wrong path — exactly the April 2026 SSD incident.
+
+    This function exits the process instead of raising so the error message
+    is visible in stderr/logs without a Python traceback burying it.
+    """
+    if not os.path.exists(path):
+        sys.stderr.write(
+            f"\nFATAL: {name} database not found at:\n    {path}\n\n"
+            f"Refusing to auto-create (prevents silent data loss if the path is wrong).\n"
+            f"If this is intentional first-time setup, run explicit init first.\n\n"
+        )
+        sys.exit(1)
+
+
+def _is_handle(recipient):
+    """True iff `recipient` is already a deliverable iMessage handle (no name lookup needed)."""
+    if not recipient or not isinstance(recipient, str):
+        return False
+    r = recipient.strip()
+    if r.startswith("chat_guid:") and len(r) > len("chat_guid:"):
+        return True
+    if r.startswith("+") and r[1:].isdigit() and 8 <= len(r[1:]) <= 15:
+        return True
+    if r.isdigit():
+        return True
+    if "@" in r:
+        local, _, domain = r.partition("@")
+        if local and "." in domain:
+            return True
+    return False
+
+
+def _resolve_recipient(recipient):
+    """Turn a name/alias like 'Manan' or 'family chat' into a deliverable handle.
+
+    If `recipient` already looks like a phone, chat_guid, email, or numeric
+    chat-id, it is returned untouched. Otherwise we try the household
+    contacts lookup (infrastructure/contacts/contacts.sqlite, populated
+    nightly by sync-contacts.py from Apple Contacts + CONTACTS.md group
+    chats). If the lookup returns a handle, we use that. If not, we return
+    the original string so the validator produces the actionable error.
+    """
+    if _is_handle(recipient):
+        return recipient
+    try:
+        contacts_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "contacts")
+        if contacts_dir not in sys.path:
+            sys.path.insert(0, contacts_dir)
+        import contacts as _contacts  # type: ignore
+        resolved = _contacts.resolve(recipient)
+        if resolved:
+            return resolved
+    except Exception:
+        # contacts module missing or DB unreachable — fall through to validator,
+        # which will produce a clear error for the caller.
+        pass
+    return recipient
+
+
+def _validate_recipient(recipient):
+    """Raise ValueError unless recipient is a deliverable handle.
+
+    sender.py hands the recipient string to `imsg`; imsg will happily accept
+    anything and ask iMessage to resolve it. If the string is a contact NAME
+    like "Manan" instead of a phone, iMessage routes to whatever Contacts
+    resolves that name to — typically the user's own card or nothing — and
+    the message silently fails delivery (red "Not Delivered" in the UI) while
+    the outbox marks it "delivered" because imsg's immediate return was OK.
+
+    Accept only formats that imsg + iMessage can actually route:
+      - "+<E.164>"         phone, e.g. "+15551234567"
+      - "chat_guid:<GUID>" iMessage group-chat GUID
+      - "<digits>"         legacy numeric chat-id (imsg --chat-id)
+      - "<email>"          Apple ID email handle (must contain '@' + '.')
+    """
+    if recipient is None or not isinstance(recipient, str):
+        raise ValueError(f"recipient must be a non-empty string, got {recipient!r}")
+    r = recipient.strip()
+    if not r:
+        raise ValueError("recipient is empty")
+    if _is_handle(r):
+        return
+    raise ValueError(
+        f"invalid recipient {r!r} — not a deliverable handle and not a known "
+        f"contact alias. Use a phone '+<E.164>' (e.g. '+15551234567'), "
+        f"'chat_guid:<GUID>', an email handle, or a name/alias that's in "
+        f"contacts.sqlite (run `contacts list` to see what's registered, or "
+        f"add the person to Apple Contacts and run `python3 "
+        f"~/.config/spratt/skills/sync-contacts.py`)."
+    )
+
 SCHEMA = """
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -53,11 +150,12 @@ CREATE TABLE IF NOT EXISTS messages (
     max_retries INTEGER NOT NULL DEFAULT 3,
     source      TEXT,
     created_by  TEXT,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
-    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     delivered_at TEXT,
     failed_at   TEXT,
-    error       TEXT
+    error       TEXT,
+    trip_id     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending ON messages(status, send_at) WHERE status = 'pending';
@@ -66,11 +164,23 @@ CREATE INDEX IF NOT EXISTS idx_source ON messages(source);
 
 
 class OutboxDB:
-    def __init__(self, db_path=None):
+    def __init__(self, db_path=None, allow_create=False):
+        """Open the outbox DB. Refuses to auto-create unless allow_create=True.
+
+        allow_create=True is only for explicit init paths. Normal operational
+        code (sender daemon, briefings, trip outbox gen) must NOT pass it —
+        missing DB should be a loud failure, not a silent empty-DB creation.
+        """
         self.db_path = db_path or DB_PATH
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        if not allow_create:
+            require_db_file(self.db_path, "outbox")
+        else:
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
+        # SCHEMA uses CREATE TABLE IF NOT EXISTS — safe no-op when table exists,
+        # and on a freshly-initialized DB (allow_create=True) it lays down the
+        # correct current schema.
         self.conn.executescript(SCHEMA)
 
     def _now(self):
@@ -91,6 +201,10 @@ class OutboxDB:
             return send_at.replace("T", " ").replace("Z", "")
 
     def schedule(self, recipient, body, send_at="now", source=None, created_by=None, priority=0, max_retries=3, trip_id=None):
+        # Resolve names/aliases ("Manan", "family chat") to handles before validating,
+        # so callers can pass either a phone number or a household alias.
+        recipient = _resolve_recipient(recipient)
+        _validate_recipient(recipient)
         send_at = self._parse_send_at(send_at)
         cur = self.conn.execute(
             """INSERT INTO messages (recipient, body, send_at, priority, source, created_by, max_retries, trip_id)
@@ -243,16 +357,35 @@ def main():
     # overdue
     sub.add_parser("overdue")
 
+    # init — explicit first-time setup (creates empty outbox.sqlite)
+    sub.add_parser("init", help="Create a new empty outbox DB at the expected path")
+
     args = parser.parse_args()
+
+    # init is the only path that's allowed to create the DB file.
+    if args.command == "init":
+        if os.path.exists(DB_PATH):
+            print(f"Outbox DB already exists at {DB_PATH} — nothing to do.")
+            sys.exit(0)
+        OutboxDB(allow_create=True).close()
+        print(f"Initialized new outbox DB at {DB_PATH}")
+        sys.exit(0)
+
     db = OutboxDB()
 
     if args.command == "schedule":
-        row_id = db.schedule(
-            recipient=args.to, body=args.body, send_at=args.at,
-            source=args.source, created_by=args.created_by,
-            priority=args.priority, max_retries=args.max_retries,
-            trip_id=args.trip_id,
-        )
+        try:
+            row_id = db.schedule(
+                recipient=args.to, body=args.body, send_at=args.at,
+                source=args.source, created_by=args.created_by,
+                priority=args.priority, max_retries=args.max_retries,
+                trip_id=args.trip_id,
+            )
+        except ValueError as e:
+            # Print to stderr and exit 1 so callers (cron prompts, shell scripts)
+            # see a clear, single-line error instead of a Python traceback.
+            print(f"outbox: refusing to schedule — {e}", file=sys.stderr)
+            sys.exit(1)
         print(json.dumps({"id": row_id, "status": "scheduled"}))
 
     elif args.command == "cancel":

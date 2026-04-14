@@ -5,8 +5,8 @@ trip-status.py — Daily trip status transitions + outbox cleanup.
 Runs via exec cron at midnight. No LLM.
 
 Transitions:
-  upcoming -> active   (when start_date <= today <= end_date)
-  active -> completed  (when end_date < today)
+  upcoming → active   (when start_date <= today <= end_date)
+  active → completed  (when end_date < today)
 
 On completion: cancels pending outbox messages for that trip.
 
@@ -25,13 +25,25 @@ import urllib.request
 from logging.handlers import RotatingFileHandler
 from datetime import date
 
-# --- Config ---
+# ─── Config ───
 
 TRIPS_DB = os.path.expanduser("~/.config/spratt/trips/trips.sqlite")
 OUTBOX_DB = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.sqlite")
 LOG_FILE = os.path.expanduser("~/Library/Logs/spratt/trip-status.log")
 
-# --- Logging ---
+
+def require_db_file(path, name):
+    """Fail loudly if a SQLite DB file doesn't exist where expected.
+    Prevents silent split-brain from path resolution bugs.
+    """
+    if not os.path.exists(path):
+        sys.stderr.write(
+            f"\nFATAL: {name} database not found at:\n    {path}\n\n"
+            f"Refusing to auto-create (prevents silent data loss if the path is wrong).\n\n"
+        )
+        sys.exit(1)
+
+# ─── Logging ───
 
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 logging.basicConfig(
@@ -46,11 +58,12 @@ log = logging.getLogger(__name__)
 
 
 OUTBOX_CLI = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.py")
-OWNER_PHONE = "+1XXXXXXXXXX"  # Replace with your phone number
+MANAN = "Manan"  # resolved by outbox.py via contacts.sqlite
 
 
 def generate_trip_summary(trip_id):
     """Query trip data from DB and schedule a summary message via Haiku."""
+    require_db_file(TRIPS_DB, "trips")
     conn = sqlite3.connect(TRIPS_DB)
     conn.row_factory = sqlite3.Row
 
@@ -118,18 +131,9 @@ def generate_trip_summary(trip_id):
     result = json.loads(resp.read())
     summary = result["content"][0]["text"].strip()
 
-    # Find group chat from trip manifest, or default to owner
-    manifest_path = trip["manifest_path"]
-    recipient = OWNER_PHONE
-    if manifest_path:
-        full_path = os.path.expanduser(f"~/.config/spratt/{manifest_path}")
-        if os.path.exists(full_path):
-            import re
-            with open(full_path) as f:
-                content = f.read()
-            guid_match = re.search(r"chat_guid[:\s]+(\S+)", content, re.IGNORECASE)
-            if guid_match:
-                recipient = f"chat_guid:{guid_match.group(1)}"
+    # Use group chat from trip DB, fall back to Manan
+    group_chat = trip["group_chat_guid"]
+    recipient = f"chat_guid:{group_chat}" if group_chat else MANAN
 
     # Schedule via outbox
     subprocess.run(
@@ -148,7 +152,7 @@ def generate_trip_summary(trip_id):
 
 
 def run():
-    # --- Open trips database ---
+    # ─── Open trips database ───
     if not os.path.exists(TRIPS_DB):
         log.error(f"cannot open trips.sqlite: file not found at {TRIPS_DB}")
         return 1
@@ -165,7 +169,7 @@ def run():
     completed_trips = []
 
     try:
-        # --- upcoming -> active ---
+        # ─── upcoming → active ───
         upcoming = trips_conn.execute(
             "SELECT id, status FROM trips WHERE status = 'upcoming' AND start_date <= ? AND end_date >= ?",
             (today, today),
@@ -176,10 +180,10 @@ def run():
                 "UPDATE trips SET status = 'active', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
                 (row["id"],),
             )
-            log.info(f"{row['id']}: upcoming -> active")
+            log.info(f"{row['id']}: upcoming → active")
             transitions += 1
 
-        # --- active -> completed ---
+        # ─── active → completed ───
         active = trips_conn.execute(
             "SELECT id, status FROM trips WHERE status = 'active' AND end_date < ?",
             (today,),
@@ -190,7 +194,7 @@ def run():
                 "UPDATE trips SET status = 'completed', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
                 (row["id"],),
             )
-            log.info(f"{row['id']}: active -> completed")
+            log.info(f"{row['id']}: active → completed")
             transitions += 1
             completed_trips.append(row["id"])
 
@@ -203,14 +207,14 @@ def run():
 
     trips_conn.close()
 
-    # --- Generate trip summaries for completed trips ---
+    # ─── Generate trip summaries for completed trips ───
     for trip_id in completed_trips:
         try:
             generate_trip_summary(trip_id)
         except Exception as e:
             log.error(f"summary generation failed for {trip_id}: {e}")
 
-    # --- Cancel pending outbox messages for completed trips ---
+    # ─── Cancel pending outbox messages for completed trips ───
     if completed_trips:
         if not os.path.exists(OUTBOX_DB):
             log.error(f"cannot open outbox.sqlite: file not found at {OUTBOX_DB}")

@@ -22,7 +22,19 @@ from outbox import OutboxDB
 IMSG_BIN = "/opt/homebrew/bin/imsg"
 POLL_INTERVAL = 60
 LOG_FILE = os.path.expanduser("~/Library/Logs/spratt/outbox-sender.log")
-OWNER_PHONE = "+1XXXXXXXXXX"  # Replace with your phone number
+
+# Resolve Manan's handle via contacts.sqlite for the loop-avoidance comparison
+# in deliver_one(). Falls back to the alias string if contacts is unavailable —
+# in that case the comparison may not detect recipient==Manan, but alerts still
+# get scheduled and the outbox re-resolves aliases at schedule time.
+_CONTACTS_DIR = os.path.expanduser("~/.config/spratt/infrastructure/contacts")
+if _CONTACTS_DIR not in sys.path:
+    sys.path.insert(0, _CONTACTS_DIR)
+try:
+    import contacts as _contacts
+    MANAN = _contacts.resolve("Manan") or "Manan"
+except Exception:
+    MANAN = "Manan"
 
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 logging.basicConfig(
@@ -88,10 +100,10 @@ def process_cycle(db):
                 failed += 1
                 log.error(f"FAILED [{msg_id}] to={recipient} src={source} error={error}")
 
-                # Alert owner via outbox (the next cycle will deliver this alert)
-                if recipient != OWNER_PHONE:
+                # Alert Manan via outbox (the next cycle will deliver this alert)
+                if recipient != MANAN:
                     db.schedule(
-                        recipient=OWNER_PHONE,
+                        recipient=MANAN,
                         body=f"[outbox] Failed to deliver to {recipient} (src={source}): {error}. Message: {body[:150]}",
                         send_at="now",
                         source="system:alert",

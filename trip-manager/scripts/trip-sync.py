@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-trip-sync.py — Extract structured trip data from manifests -> upsert tables.
+trip-sync.py — Extract structured trip data from manifests → upsert tables.
 
-Uses Claude Haiku to read the manifest body and extract structured JSON.
+Uses Gemini Flash to read the manifest body and extract structured JSON.
 No frontmatter needed. The LLM writes naturally, this script extracts.
 
 Two modes:
@@ -32,12 +32,64 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-# --- Config ---
+# ─── Config ───
 
 TRIPS_DB = os.path.expanduser("~/.config/spratt/trips/trips.sqlite")
+OUTBOX_DB = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.sqlite")
 TRIPS_DIR = os.path.expanduser("~/.config/spratt/memory/trips")
 LAST_SYNC_FILE = os.path.expanduser("~/.config/spratt/trips/.last-sync")
 LOG_FILE = os.path.expanduser("~/Library/Logs/spratt/trip-sync.log")
+
+
+def require_db_file(path, name):
+    """Fail loudly if a SQLite DB file doesn't exist where expected.
+
+    Prevents silent split-brain from path resolution bugs (stale symlinks,
+    moved files) that would otherwise cause sqlite3.connect() to create an
+    empty new DB at the wrong path.
+    """
+    if not os.path.exists(path):
+        sys.stderr.write(
+            f"\nFATAL: {name} database not found at:\n    {path}\n\n"
+            f"Refusing to auto-create (prevents silent data loss if the path is wrong).\n\n"
+        )
+        sys.exit(1)
+
+
+def cancel_outbox_by_ids(msg_ids):
+    """Cancel pending outbox messages by specific ID.
+
+    Call this BEFORE clearing outbox_msg_id pointers or DELETing trip-side rows
+    that reference outbox messages. Without this, every sync that changes a
+    flight/hotel/reservation leaves the old outbox row pending while the new
+    one gets created alongside it — causing duplicate notifications.
+
+    Only touches rows with status='pending' — delivered/cancelled/failed are
+    left alone. Uses cancel-by-ID (never bulk DELETE or prefix match) to keep
+    the blast radius to exactly the intended rows.
+    """
+    ids = [i for i in (msg_ids or []) if i]
+    if not ids:
+        return 0
+    try:
+        require_db_file(OUTBOX_DB, "outbox")
+        outbox_conn = sqlite3.connect(OUTBOX_DB)
+        placeholders = ",".join("?" * len(ids))
+        cur = outbox_conn.execute(
+            f"UPDATE messages SET status='cancelled', "
+            f"updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            f"WHERE id IN ({placeholders}) AND status='pending'",
+            ids,
+        )
+        cancelled = cur.rowcount
+        outbox_conn.commit()
+        outbox_conn.close()
+        if cancelled > 0:
+            log.info(f"cancelled {cancelled} stale outbox msg(s): {ids}")
+        return cancelled
+    except Exception as e:
+        log.error(f"cancel_outbox_by_ids failed for {ids}: {e}")
+        return 0
 
 # Claude Haiku API — reliable structured extraction with guaranteed valid JSON
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -63,12 +115,12 @@ KNOWN_TIMEZONES = {
 
 EXTRACTION_PROMPT = """Extract trip data as JSON. Only extract what's explicitly stated — use null for missing fields. Timezone = IANA name from destination city. Flight times = ISO 8601 with UTC offset (ET in April = -04:00, PT = -07:00). Reservation times in 24h format (18:45).
 
-{"trip_id":"str","name":"str|null","travelers":"str|null","destination":"str|null","timezone":"IANA|null","start_date":"YYYY-MM-DD|null","end_date":"YYYY-MM-DD|null","flights":[{"traveler":"str|null","flight_number":"str","route":"ABC -> DEF","departs":"ISO8601|null","arrives":"ISO8601|null"}],"hotels":[{"name":"str|null","address":"str|null","check_in":"YYYY-MM-DD|null","check_out":"YYYY-MM-DD|null"}],"reservations":[{"type":"dinner|brunch|activity|tour","name":"str","date":"YYYY-MM-DD","time":"HH:MM","address":"str|null"}]}
+{"trip_id":"str","name":"str|null","travelers":"str|null","destination":"str|null","timezone":"IANA|null","start_date":"YYYY-MM-DD|null","end_date":"YYYY-MM-DD|null","flights":[{"traveler":"str|null","flight_number":"str","route":"ABC → DEF","departs":"ISO8601|null","arrives":"ISO8601|null"}],"hotels":[{"name":"str|null","address":"str|null","check_in":"YYYY-MM-DD|null","check_out":"YYYY-MM-DD|null"}],"reservations":[{"type":"dinner|brunch|activity|tour","name":"str","date":"YYYY-MM-DD","time":"HH:MM","address":"str|null"}]}
 
 MANIFEST:
 """
 
-# --- Logging ---
+# ─── Logging ───
 
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 logging.basicConfig(
@@ -82,7 +134,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# --- LLM Extraction ---
+# ─── LLM Extraction ───
 
 # Claude structured outputs limits union types to 16. Use plain strings with empty = missing.
 EXTRACTION_SCHEMA = {
@@ -220,7 +272,7 @@ def extract_from_manifest(manifest_path):
     return data
 
 
-# --- Timezone Resolution ---
+# ─── Timezone Resolution ───
 
 def resolve_timezone(tz_raw, destination):
     """Resolve timezone. Returns IANA name or None."""
@@ -244,10 +296,16 @@ def resolve_timezone(tz_raw, destination):
     return None
 
 
-# --- Validation ---
+# ─── Validation ───
 
 def validate_extracted(data, manifest_path):
-    """Validate extracted data. Returns (trip_dict, flights_list, hotels_list, reservations_list, error)."""
+    """Validate extracted data.
+
+    Returns (trip_dict, flights_list, hotels_list, reservations_list, error).
+    Early-return error paths must emit all 5 tuple values to match the caller's
+    unpack at sync_one — otherwise malformed extractions crash with ValueError
+    instead of logging cleanly.
+    """
     if not data or not isinstance(data, dict):
         return None, None, None, None, "extraction returned empty or non-dict"
 
@@ -365,7 +423,7 @@ def validate_extracted(data, manifest_path):
     return trip, flights, hotels, reservations, None
 
 
-# --- Database ---
+# ─── Database ───
 
 def upsert_trip(conn, trip):
     """Upsert a trip row."""
@@ -398,16 +456,25 @@ def upsert_trip(conn, trip):
 
 
 def sync_flights(conn, trip_id, flights):
-    """Sync flights. Detect changes, clear outbox_msg_id on data change."""
+    """Sync flights. Detect changes, clear outbox_msg_id on data change.
+
+    When a flight's data changes or it's removed from the manifest, the OLD
+    outbox message (referenced by outbox_msg_id) is cancelled before the
+    pointer is cleared. Without this, stale pending messages accumulate.
+    """
     if not flights:
         return 0
 
     existing = {}
     for row in conn.execute(
-        "SELECT flight_number, departs_utc, arrives_utc, traveler, route FROM flights WHERE trip_id = ?",
+        "SELECT flight_number, departs_utc, arrives_utc, traveler, route, outbox_msg_id "
+        "FROM flights WHERE trip_id = ?",
         (trip_id,),
     ).fetchall():
-        existing[row[0]] = {"departs_utc": row[1], "arrives_utc": row[2], "traveler": row[3], "route": row[4]}
+        existing[row[0]] = {
+            "departs_utc": row[1], "arrives_utc": row[2], "traveler": row[3],
+            "route": row[4], "outbox_msg_id": row[5],
+        }
 
     manifest_flight_numbers = set()
     count = 0
@@ -425,6 +492,9 @@ def sync_flights(conn, trip_id, flights):
                 or old["route"] != f["route"]
             )
             if changed:
+                # Cancel the stale outbox message before clearing the pointer.
+                if old.get("outbox_msg_id"):
+                    cancel_outbox_by_ids([old["outbox_msg_id"]])
                 conn.execute("""
                     UPDATE flights SET
                         traveler = ?, route = ?, departs_utc = ?, arrives_utc = ?,
@@ -445,8 +515,15 @@ def sync_flights(conn, trip_id, flights):
 
     removed = set(existing.keys()) - manifest_flight_numbers
     for fn in removed:
+        # Cancel any pending outbox message for this now-removed flight
+        # (covers renames like "1412" → "DL1412" where the old flight_number
+        #  is no longer in the manifest but its outbox row is still pending).
+        old_msg_id = existing[fn].get("outbox_msg_id")
+        if old_msg_id:
+            cancel_outbox_by_ids([old_msg_id])
         conn.execute(
-            "UPDATE flights SET status = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+            "UPDATE flights SET status = 'cancelled', outbox_msg_id = NULL, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
             "WHERE trip_id = ? AND flight_number = ?", (trip_id, fn))
         log.info(f"flight {fn} removed from manifest — marked cancelled")
 
@@ -454,18 +531,30 @@ def sync_flights(conn, trip_id, flights):
 
 
 def sync_hotels(conn, trip_id, hotels):
-    """Sync hotels. Compare before replacing to preserve outbox tracking."""
+    """Sync hotels. Compare before replacing to preserve outbox tracking.
+
+    When the hotel set changes we DELETE + re-INSERT. Before the DELETE,
+    cancel any pending outbox messages tied to the old rows — otherwise
+    check-in reminders for stale hotel names (like '-' or '+null' from
+    earlier LLM extractions) stay pending and fire alongside the current one.
+    """
     if not hotels:
         return 0
 
     old_hotels = conn.execute(
-        "SELECT name, address, check_in, check_out FROM hotels WHERE trip_id = ?", (trip_id,)
+        "SELECT name, address, check_in, check_out, outbox_msg_id FROM hotels WHERE trip_id = ?",
+        (trip_id,),
     ).fetchall()
     old_set = {(r[0], r[1], r[2], r[3]) for r in old_hotels}
     new_set = {(h["name"], h["address"], h["check_in"], h["check_out"]) for h in hotels}
 
     if old_set == new_set:
         return 0  # No change
+
+    # Cancel stale outbox messages from the rows about to be deleted.
+    old_outbox_ids = [r[4] for r in old_hotels if r[4]]
+    if old_outbox_ids:
+        cancel_outbox_by_ids(old_outbox_ids)
 
     conn.execute("DELETE FROM hotels WHERE trip_id = ?", (trip_id,))
     for h in hotels:
@@ -478,16 +567,27 @@ def sync_hotels(conn, trip_id, hotels):
 
 
 def sync_reservations(conn, trip_id, reservations):
-    """Sync reservations. Match on name+date, detect changes."""
+    """Sync reservations. Match on name+date, detect changes.
+
+    On data change, cancel the stale outbox message before clearing the
+    pointer. On removal from manifest, cancel outbox and mark the
+    reservation as CANCELLED in notes so trip-outbox-gen skips it (the
+    existing convention — see trip-outbox-gen:225).
+    """
     if not reservations:
         return 0
 
     existing = {}
     for row in conn.execute(
-        "SELECT id, name, date, time, address, type FROM reservations WHERE trip_id = ?", (trip_id,)
+        "SELECT id, name, date, time, address, type, outbox_msg_id, notes "
+        "FROM reservations WHERE trip_id = ?",
+        (trip_id,),
     ).fetchall():
         key = (row[1], row[2])  # name + date
-        existing[key] = {"id": row[0], "time": row[3], "address": row[4], "type": row[5]}
+        existing[key] = {
+            "id": row[0], "time": row[3], "address": row[4], "type": row[5],
+            "outbox_msg_id": row[6], "notes": row[7] or "",
+        }
 
     manifest_keys = set()
     count = 0
@@ -500,6 +600,9 @@ def sync_reservations(conn, trip_id, reservations):
         if old:
             changed = old["time"] != r["time"] or old["address"] != r["address"] or old["type"] != r["type"]
             if changed:
+                # Cancel stale outbox before clearing pointer
+                if old.get("outbox_msg_id"):
+                    cancel_outbox_by_ids([old["outbox_msg_id"]])
                 conn.execute("""
                     UPDATE reservations SET type = ?, time = ?, address = ?,
                         outbox_msg_id = NULL, outbox_generated_at = NULL,
@@ -515,17 +618,33 @@ def sync_reservations(conn, trip_id, reservations):
             log.info(f"reservation added: {r['name']} on {r['date']}")
         count += 1
 
+    # Reservations removed from manifest: cancel their outbox + mark notes=CANCELLED
+    # (trip-outbox-gen already skips reservations with 'CANCELLED' in notes).
+    removed_keys = set(existing.keys()) - manifest_keys
+    for key in removed_keys:
+        old = existing[key]
+        if old.get("outbox_msg_id"):
+            cancel_outbox_by_ids([old["outbox_msg_id"]])
+        new_notes = old["notes"]
+        if "CANCELLED" not in new_notes:
+            new_notes = (new_notes + " [CANCELLED — removed from manifest]").strip()
+        conn.execute(
+            "UPDATE reservations SET notes = ?, outbox_msg_id = NULL, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
+            (new_notes, old["id"]),
+        )
+        log.info(f"reservation {key[0]} on {key[1]} removed from manifest — marked cancelled")
+
     return count
 
 
-# --- Post-Sync Outbox Generation (delegates to trip-outbox-gen.py) ---
+# ─── Post-Sync Outbox Generation (delegates to trip-outbox-gen.py) ───
 
 _trip_dir = os.path.dirname(os.path.abspath(__file__))
 if _trip_dir not in sys.path:
     sys.path.insert(0, _trip_dir)
 import importlib
 _outbox_gen = importlib.import_module("trip-outbox-gen")
-_flight_state = importlib.import_module("trip-flight-state")
 
 
 def generate_outbox_messages(trip_id):
@@ -533,20 +652,13 @@ def generate_outbox_messages(trip_id):
     return _outbox_gen.generate_for_trip(trip_id)
 
 
-def sync_flight_monitor_state(trip_id):
-    """Update flight monitor state.json so new flights get tracked automatically."""
-    try:
-        a, u, r = _flight_state.sync_trip_flights(trip_id)
-        if a > 0 or u > 0 or r > 0:
-            log.info(f"flight monitor state: {a} added, {u} updated, {r} removed")
-    except Exception as e:
-        log.warning(f"flight state sync failed (non-fatal): {e}")
+# Flight monitor now reads flights directly from trips.sqlite — no state file to sync.
 
 
-# --- Sync One Manifest ---
+# ─── Sync One Manifest ───
 
 def alert_failure(manifest_path, error_msg):
-    """Send failure alert to owner via outbox."""
+    """Send failure alert to Manan via outbox."""
     try:
         import subprocess
         short_name = os.path.basename(manifest_path)
@@ -556,7 +668,7 @@ def alert_failure(manifest_path, error_msg):
                 "python3",
                 os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.py"),
                 "schedule",
-                "--to", "+1XXXXXXXXXX",  # Replace with your phone number
+                "--to", "Manan",
                 "--body", body,
                 "--at", "now",
                 "--source", "system:trip-sync-alert",
@@ -591,6 +703,7 @@ def sync_one(manifest_path):
         log.error(f"manifest {manifest_path} validation failed: {error}")
         return False
 
+    require_db_file(TRIPS_DB, "trips")
     conn = sqlite3.connect(TRIPS_DB)
     try:
         trip_ok = upsert_trip(conn, trip)
@@ -599,12 +712,11 @@ def sync_one(manifest_path):
         resv_count = sync_reservations(conn, trip["id"], reservations) if trip_ok else 0
         conn.commit()
 
-        # Post-sync: generate outbox messages + update flight monitor
+        # Post-sync: generate outbox messages. Flight monitor reads trips.sqlite
+        # directly each cycle — no sidecar state file to keep in sync.
         outbox_count = 0
         if trip_ok:
             outbox_count = generate_outbox_messages(trip["id"])
-            if flight_count > 0:
-                sync_flight_monitor_state(trip["id"])
     except Exception as e:
         conn.rollback()
         log.error(f"failed to write to trips.sqlite: {e}")
@@ -626,7 +738,7 @@ def sync_one(manifest_path):
     return True
 
 
-# --- Directory Scan Mode ---
+# ─── Directory Scan Mode ───
 
 def get_last_sync_time():
     try:
@@ -675,7 +787,7 @@ def scan_directory():
     return 0
 
 
-# --- Main ---
+# ─── Main ───
 
 def main():
     if len(sys.argv) < 2:

@@ -10,13 +10,32 @@ metadata: {"clawdbot":{"emoji":"📍","requires":{"bins":["sqlite3"]}}}
 
 ### Step 1: Fetch and extract place info
 
-**Social media URLs (instagram.com, facebook.com, tiktok.com):**
-1. `openclaw browser navigate "URL"` — uses the default `openclaw` browser profile (logged in to Instagram/Facebook). **NEVER pass `profile: "user"`** — it will fail.
-2. Wait for page load
-3. `openclaw browser snapshot --format ai` to extract text
-4. Click "See more" if needed to expand the full description
-5. Extract: place name, location, what kind of place it is, any pricing info
-6. Do NOT use web_fetch for social media — it returns a login wall with no content
+**Instagram URLs (`instagram.com/reel/<ID>/`, `instagram.com/p/<ID>/`):**
+
+1. **Extract the post ID from the URL first.** The ID is the path segment after `/reel/` or `/p/`. Remember it — you'll use it to verify you got the right content.
+
+2. **Try oEmbed first.** It's scoped to the exact URL — no feed-scroll mistake possible:
+   ```bash
+   curl -sf "https://api.instagram.com/oembed/?url=$URL" | jq '{title, author_name, author_url, thumbnail_url}'
+   ```
+   Returns caption (`title`), creator handle (`author_name`), and profile URL (`author_url`). If this works, use it directly. Skip to Step 2 of the overall flow.
+
+3. **Verify the oEmbed match.** The `author_url` must contain the handle from the input URL's path (e.g., URL was `instagram.com/<handle>/reel/<ID>/` or the post links back to a profile consistent with the reel). If the handles diverge, discard oEmbed's result and fall through to the browser path.
+
+4. **Browser fallback** (oEmbed returned an error, auth wall, rate limit, or mismatched handle):
+   - `openclaw browser navigate "URL"` — uses the default `openclaw` browser profile (logged in). **NEVER pass `profile: "user"`** — it will fail.
+   - Wait for page load.
+   - `openclaw browser snapshot --format ai` to extract text.
+   - **Verify the snapshot matches the URL.** The post ID you extracted in Step 1 must appear in the snapshot output (URL bar, meta, or embedded link). If it doesn't, Instagram's feed scrolled and you're looking at a different reel — navigate to the URL again and re-snapshot. Do NOT proceed with content from a different post.
+   - Click "See more" if needed to expand the full description.
+
+5. Extract: place name, location, what kind of place it is, any pricing info.
+
+6. **Do NOT save anything** if you couldn't verify the extracted content against the post ID from Step 1. Reply asking what the place is instead of guessing.
+
+**Facebook / TikTok URLs:** Use the browser fallback path above (Steps 4-6). oEmbed is Instagram-specific here.
+
+7. Do NOT use `web_fetch` for social media — it returns a login wall with no content.
 
 **Google Maps URLs (maps.google.com, goo.gl/maps, maps.app.goo.gl):**
 - Use web_fetch or browser tool

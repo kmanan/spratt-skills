@@ -24,14 +24,26 @@ import sqlite3
 import logging
 from logging.handlers import RotatingFileHandler
 
-# --- Config ---
+# ─── Config ───
 
 TRIPS_DB = os.path.expanduser("~/.config/spratt/trips/trips.sqlite")
 STATE_FILE = os.path.expanduser("~/.config/spratt/infrastructure/flight-monitor/state.json")
 LOG_FILE = os.path.expanduser("~/Library/Logs/spratt/trip-flight-state.log")
-OWNER_PHONE = "+1XXXXXXXXXX"  # Replace with your phone number
+MANAN_PHONE = "Manan"  # resolved by outbox.py via contacts.sqlite
 
-# --- Logging ---
+
+def require_db_file(path, name):
+    """Fail loudly if a SQLite DB file doesn't exist where expected.
+    Prevents silent split-brain from path resolution bugs.
+    """
+    if not os.path.exists(path):
+        sys.stderr.write(
+            f"\nFATAL: {name} database not found at:\n    {path}\n\n"
+            f"Refusing to auto-create (prevents silent data loss if the path is wrong).\n\n"
+        )
+        sys.exit(1)
+
+# ─── Logging ───
 
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 logging.basicConfig(
@@ -104,9 +116,9 @@ def build_flight_entry(conn, flight_row, trip_row, existing_entry):
     traveler = flight_row["traveler"] or "Unknown"
     route = flight_row["route"] or ""
 
-    # Build label: "Traveler DCA to SEA"
-    if "\u2192" in route:
-        parts = route.split("\u2192")
+    # Build label: "Dad DCA to SEA"
+    if "→" in route:
+        parts = route.split("→")
         label = f"{traveler} {parts[0].strip()} to {parts[1].strip()}"
     else:
         label = f"{traveler} {route}"
@@ -125,14 +137,14 @@ def build_flight_entry(conn, flight_row, trip_row, existing_entry):
         if trav:
             notify_chat = trav["phone"]
 
-    # notify_also: all traveler phones for this trip (always include owner)
+    # notify_also: all traveler phones for this trip (always include Manan)
     travelers = conn.execute(
         "SELECT phone FROM travelers WHERE trip_id = ? AND phone IS NOT NULL",
         (flight_row["trip_id"],),
     ).fetchall()
     notify_also = list({t["phone"] for t in travelers})
-    if OWNER_PHONE not in notify_also:
-        notify_also.append(OWNER_PHONE)
+    if MANAN_PHONE not in notify_also:
+        notify_also.append(MANAN_PHONE)
 
     # Hotel info
     hotel = conn.execute(
@@ -174,6 +186,7 @@ def build_flight_entry(conn, flight_row, trip_row, existing_entry):
 
 def sync_trip_flights(trip_id, dry_run=False):
     """Sync state.json entries for one trip's flights. Returns (added, updated, removed) counts."""
+    require_db_file(TRIPS_DB, "trips")
     conn = sqlite3.connect(TRIPS_DB)
     conn.row_factory = sqlite3.Row
 
@@ -221,6 +234,9 @@ def sync_trip_flights(trip_id, dry_run=False):
             log.info(f"Added state.json entry for {fn}")
 
     # Remove state.json entries for flights no longer scheduled in ANY active/upcoming trip.
+    # This handles cancelled flights, renamed flights, and orphaned entries.
+    # We check globally because a rename changes the flight_number in-place,
+    # leaving the old entry in state.json with no DB record to match.
     removed = 0
     all_scheduled = conn.execute(
         "SELECT flight_number FROM flights f JOIN trips t ON f.trip_id = t.id "
@@ -257,6 +273,7 @@ def main():
             sys.exit(1)
         trip_id = sys.argv[2]
     elif sys.argv[1] == "--all":
+        require_db_file(TRIPS_DB, "trips")
         conn = sqlite3.connect(TRIPS_DB)
         conn.row_factory = sqlite3.Row
         trips = conn.execute(

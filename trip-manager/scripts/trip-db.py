@@ -8,7 +8,7 @@ The LLM (Spratt) calls these subcommands instead of composing raw SQL.
 
 Subcommands:
   add-trip          Create a new trip (only id required)
-  add-flight        Add a flight to a trip (local time + timezone -> UTC)
+  add-flight        Add a flight to a trip (local time + timezone → UTC)
   add-hotel         Add a hotel to a trip
   add-reservation   Add a reservation (type auto-inferred if omitted)
   add-traveler      Add a traveler with phone number
@@ -44,24 +44,14 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-# --- Config ---
+# ─── Config ───
 
 TRIPS_DB = os.path.expanduser("~/.config/spratt/trips/trips.sqlite")
 
 
 def _sync_flight_state(trip_id):
-    """Auto-update flight monitor state.json after flight changes."""
-    try:
-        import importlib
-        _trip_dir = os.path.dirname(os.path.abspath(__file__))
-        if _trip_dir not in sys.path:
-            sys.path.insert(0, _trip_dir)
-        mod = importlib.import_module("trip-flight-state")
-        a, u, r = mod.sync_trip_flights(trip_id)
-        if a > 0 or u > 0 or r > 0:
-            print(f"  monitor:     state.json updated ({a} added, {u} updated, {r} removed)")
-    except Exception as e:
-        print(f"  monitor:     state.json sync failed (non-fatal): {e}", file=sys.stderr)
+    """No-op. Flight monitor now reads trips.sqlite directly — no sidecar state to sync."""
+    return
 
 KNOWN_TIMEZONES = {
     "india": "Asia/Kolkata",
@@ -94,7 +84,7 @@ KNOWN_TIMEZONES = {
 VALID_RESERVATION_TYPES = {"dinner", "brunch", "lunch", "activity", "tour", "show", "event"}
 
 
-# --- Helpers ---
+# ─── Helpers ───
 
 def get_db():
     """Connect to trips.sqlite with WAL mode."""
@@ -280,32 +270,121 @@ def update_travelers_display(conn, trip_id):
         )
 
 
-# --- Schema Migration ---
+# ─── Schema Migration ───
+
+# Complete canonical schema for trips.sqlite. Every table and index is here so
+# a fresh DB can be fully reproduced from source (disaster recovery, new machine,
+# etc). All CREATE TABLE uses IF NOT EXISTS so this is idempotent — running it
+# against the existing live DB is a no-op.
+TRIPS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS trips (
+    id              TEXT PRIMARY KEY,
+    name            TEXT,
+    travelers       TEXT,
+    destination     TEXT,
+    timezone        TEXT,
+    tz_utc_offset   TEXT,
+    start_date      TEXT,
+    end_date        TEXT,
+    status          TEXT NOT NULL DEFAULT 'upcoming',
+    manifest_path   TEXT,
+    group_chat_guid TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_trips_status ON trips(status);
+
+CREATE TABLE IF NOT EXISTS flights (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    trip_id             TEXT NOT NULL,
+    traveler            TEXT,
+    flight_number       TEXT NOT NULL,
+    route               TEXT,
+    departs_utc         TEXT,
+    arrives_utc         TEXT,
+    status              TEXT NOT NULL DEFAULT 'scheduled',
+    gate                TEXT,
+    delay_minutes       INTEGER DEFAULT 0,
+    notified_landed     INTEGER DEFAULT 0,
+    notified_delay      INTEGER DEFAULT 0,
+    notified_gate       INTEGER DEFAULT 0,
+    last_checked        TEXT,
+    outbox_msg_id       INTEGER,
+    outbox_generated_at TEXT,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_flights_trip ON flights(trip_id);
+CREATE INDEX IF NOT EXISTS idx_flights_status ON flights(status);
+
+CREATE TABLE IF NOT EXISTS hotels (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    trip_id             TEXT NOT NULL,
+    name                TEXT,
+    address             TEXT,
+    check_in            TEXT,
+    check_out           TEXT,
+    outbox_msg_id       INTEGER,
+    outbox_generated_at TEXT,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_hotels_trip ON hotels(trip_id);
+
+CREATE TABLE IF NOT EXISTS reservations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    trip_id             TEXT NOT NULL,
+    type                TEXT NOT NULL,
+    name                TEXT,
+    date                TEXT,
+    time                TEXT,
+    address             TEXT,
+    party_size          INTEGER,
+    confirmation        TEXT,
+    notes               TEXT,
+    outbox_msg_id       INTEGER,
+    outbox_generated_at TEXT,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_trip ON reservations(trip_id);
+
+CREATE TABLE IF NOT EXISTS travelers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trip_id         TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    phone           TEXT,
+    role            TEXT,
+    created_at      TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_travelers_trip ON travelers(trip_id);
+"""
+
 
 def ensure_schema(conn):
-    """Ensure the schema has all required tables and columns for the new architecture."""
-    # Add group_chat_guid to trips if missing
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(trips)").fetchall()}
-    if "group_chat_guid" not in columns:
-        conn.execute("ALTER TABLE trips ADD COLUMN group_chat_guid TEXT")
+    """Ensure all tables, columns, and indexes exist. Idempotent.
 
-    # Create travelers table if missing
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS travelers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trip_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            phone TEXT,
-            role TEXT,
-            created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-            updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_travelers_trip ON travelers(trip_id)")
+    Runs TRIPS_SCHEMA (all CREATE TABLE IF NOT EXISTS) and also handles
+    the group_chat_guid migration for DBs that predate that column — the
+    IF NOT EXISTS on the new trips CREATE won't add columns to an
+    already-existing trips table, so older DBs still need the ALTER.
+    """
+    # Migration: older trips DBs predate group_chat_guid
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(trips)").fetchall()}
+        if "trips" in {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()} \
+                and "group_chat_guid" not in columns:
+            conn.execute("ALTER TABLE trips ADD COLUMN group_chat_guid TEXT")
+    except sqlite3.OperationalError:
+        pass  # table doesn't exist yet — CREATE below will include the column
+
+    # Full schema — idempotent on existing DBs, complete on fresh ones
+    conn.executescript(TRIPS_SCHEMA)
     conn.commit()
 
 
-# --- Subcommands ---
+# ─── Subcommands ───
 
 def cmd_add_trip(args):
     """Create a new trip. Only --id is required; everything else is optional."""
@@ -825,6 +904,9 @@ def cmd_cancel_reservation(args):
     if row["outbox_msg_id"]:
         try:
             outbox_db = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.sqlite")
+            if not os.path.exists(outbox_db):
+                print(f"ERROR: outbox DB not found at {outbox_db}", file=sys.stderr)
+                sys.exit(2)
             oconn = sqlite3.connect(outbox_db)
             oconn.execute(
                 "UPDATE messages SET status = 'cancelled', updated_at = strftime('%Y-%m-%d %H:%M:%S', 'now') WHERE id = ? AND status = 'pending'",
@@ -901,7 +983,7 @@ def cmd_view(args):
         print("=== Flights ===")
         for f in flights:
             status_tag = f" [{f['status']}]" if f["status"] != "scheduled" else ""
-            outbox_tag = " outbox:yes" if f["outbox_msg_id"] else ""
+            outbox_tag = " ✓outbox" if f["outbox_msg_id"] else ""
             print(f"{f['flight_number']}  {f['traveler'] or '?'}  {f['route'] or '?'}  {f['departs_utc'] or 'TBD'}{status_tag}{outbox_tag}")
         print()
 
@@ -914,7 +996,7 @@ def cmd_view(args):
     if hotels:
         print("=== Hotels ===")
         for h in hotels:
-            outbox_tag = " outbox:yes" if h["outbox_msg_id"] else ""
+            outbox_tag = " ✓outbox" if h["outbox_msg_id"] else ""
             print(f"{h['name'] or '(unnamed)'} — {h['address'] or '(no address)'} ({h['check_in'] or '?'} to {h['check_out'] or '?'}){outbox_tag}")
         print()
 
@@ -928,7 +1010,7 @@ def cmd_view(args):
         print("=== Reservations ===")
         for r in reservations:
             cancelled = " [CANCELLED]" if r["notes"] and "CANCELLED" in r["notes"] else ""
-            outbox_tag = " outbox:yes" if r["outbox_msg_id"] else ""
+            outbox_tag = " ✓outbox" if r["outbox_msg_id"] else ""
             conf = f" #{r['confirmation']}" if r["confirmation"] else ""
             party = f" (party of {r['party_size']})" if r["party_size"] else ""
             print(f"{r['date'] or '?'}  {r['time'] or '?'}  {r['type']:<10} {r['name']}{conf}{party} — {r['address'] or '(no address)'}{cancelled}{outbox_tag}")
@@ -981,7 +1063,7 @@ def cmd_list_trips(args):
         print(f"{t['id']:<30} {t['name'] or '(unnamed)':<30} {t['destination'] or '':<20} {dates:<25} [{t['status']}]")
 
 
-# --- Argument Parser ---
+# ─── Argument Parser ───
 
 def build_parser():
     parser = argparse.ArgumentParser(
@@ -993,7 +1075,7 @@ def build_parser():
     # add-trip
     p = sub.add_parser("add-trip", help="Create a new trip")
     p.add_argument("--id", required=True, help="Trip ID (e.g., 2026-04-dc). Lowercase, hyphens only.")
-    p.add_argument("--name", help="Trip name (e.g., 'DC Trip')")
+    p.add_argument("--name", help="Trip name (e.g., 'DC Trip — Dad + Leo')")
     p.add_argument("--destination", help="Destination city")
     p.add_argument("--start-date", dest="start_date", help="Start date (YYYY-MM-DD)")
     p.add_argument("--end-date", dest="end_date", help="End date (YYYY-MM-DD)")
@@ -1005,7 +1087,7 @@ def build_parser():
     p.add_argument("--trip", required=True, help="Trip ID")
     p.add_argument("--traveler", help="Traveler name")
     p.add_argument("--flight", required=True, help="Flight number (e.g., AS4)")
-    p.add_argument("--route", help="Route (e.g., 'SEA -> DCA')")
+    p.add_argument("--route", help="Route (e.g., 'SEA → DCA')")
     p.add_argument("--departs", help="Departure: 'YYYY-MM-DD HH:MM' local or ISO with offset")
     p.add_argument("--arrives", help="Arrival: 'YYYY-MM-DD HH:MM' local or ISO with offset")
     p.add_argument("--tz", help="Departure timezone (IANA or city). Falls back to trip timezone.")
@@ -1034,7 +1116,7 @@ def build_parser():
     p = sub.add_parser("add-traveler", help="Add a traveler to a trip")
     p.add_argument("--trip", required=True, help="Trip ID")
     p.add_argument("--name", required=True, help="Traveler name")
-    p.add_argument("--phone", help="Phone number (e.g., +1XXXXXXXXXX)")
+    p.add_argument("--phone", help="Phone number in E.164 format (e.g., +15551234567)")
     p.add_argument("--role", help="Role (e.g., primary, companion)")
 
     # update-trip
@@ -1088,7 +1170,7 @@ def build_parser():
     return parser
 
 
-# --- Main ---
+# ─── Main ───
 
 def main():
     parser = build_parser()

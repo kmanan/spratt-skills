@@ -277,6 +277,115 @@ Human → "which card for dining?"
 
 ---
 
+## Reliability Patterns
+
+A few hard-won patterns that every component follows. These exist because we
+hit the specific failure mode each prevents, and you almost certainly will too
+if you don't adopt them.
+
+### 1. Strict file-exists guard — no silent DB auto-create
+
+**Problem:** `sqlite3.connect(path)` silently creates an empty new database file
+if the path doesn't exist. Combined with `os.path.realpath(__file__)`-based path
+resolution, a stale symlink or a moved file can cause the app to create a brand
+new empty DB at the wrong path and start reading/writing to it. The real data
+sits untouched elsewhere. Split-brain, no error.
+
+This bit us in early April when 8 symlinks left after a drive migration caused
+every outbox call to silently read a stale copy of `outbox.sqlite` for hours
+before we noticed.
+
+**Pattern:** every script that opens a SQLite DB checks the file exists first;
+if not, it prints a clear `FATAL` error pointing at the expected path and exits
+with code 1. The one explicit path that *can* create a DB is an `init`
+subcommand used only for first-time setup.
+
+```python
+def require_db_file(path, name):
+    """Fail loudly if a SQLite DB file doesn't exist where expected."""
+    if not os.path.exists(path):
+        sys.stderr.write(
+            f"\nFATAL: {name} database not found at:\n    {path}\n\n"
+            f"Refusing to auto-create (prevents silent data loss if the path is wrong).\n\n"
+        )
+        sys.exit(1)
+```
+
+Applied in `outbox.py` (`OutboxDB.__init__(allow_create=False)`), and in every
+trip-manager, card-wallet, and orders script that connects to a DB.
+
+### 2. Schema-as-code — full canonical schema in source
+
+**Problem:** Tables created once via manual `sqlite3` CLI or an init script
+that's since been lost can't be reproduced from code. Disaster recovery or
+setup on a new machine hits a wall where scripts reference tables that don't
+exist in a fresh DB.
+
+Worse: partial drift. `outbox.py`'s embedded SCHEMA had fallen behind the live
+DB — missing a `trip_id` column added later via `ALTER TABLE`, and using a
+different timestamp default format. Runtime was fine because `CREATE TABLE IF
+NOT EXISTS` is a no-op when the table exists. But if the file were ever lost,
+a recreated DB would be subtly wrong and every `schedule()` call with
+`trip_id` would fail cryptically.
+
+**Pattern:** every database has its complete canonical schema in the primary
+module, as a `SCHEMA` constant using `CREATE TABLE IF NOT EXISTS` (idempotent).
+Every column, every index, every default — no hidden migrations, no ALTER-only
+columns.
+
+- `outbox/scripts/outbox.py` → `SCHEMA` covers the `messages` table
+- `trip-manager/scripts/trip-db.py` → `TRIPS_SCHEMA` covers 5 tables
+- `card-wallet/scripts/card-wallet-check.py` → `CARDS_SCHEMA` covers 7 tables
+- `smart-reorder/scripts/order-ingest.py` → `ORDERS_SCHEMA` covers 2 tables
+
+Verified by applying each source schema to a fresh empty DB and comparing
+column-by-column against the live DB.
+
+### 3. Cancel-by-specific-ID — never bulk DELETE
+
+**Problem:** A single `DELETE FROM messages` without a WHERE clause wiped the
+entire outbox history once. Bulk operations have unbounded blast radius and
+are one typo away from permanent loss.
+
+**Pattern:** all cleanup uses `UPDATE status='cancelled' WHERE id IN (...)`
+with specific row IDs. No `DELETE`, no prefix matching, no time-based bulk.
+Cancelled rows stay in the table as an audit trail. If you really need to
+reclaim space, do it separately and deliberately — not as part of normal flow.
+
+This is enforced by convention and by a CRITICAL rule in CLAUDE.md.
+
+### 4. Cancel old outbox row before NULLing its pointer
+
+**Problem:** When `trip-sync.py` detected that a flight/hotel/reservation had
+changed, it cleared the row's `outbox_msg_id` to NULL so `trip-outbox-gen.py`
+would regenerate a new outbox message. But the old outbox row the pointer
+previously referenced was left pending. Every edit added one new pending
+message and orphaned the old one — three edits to the same flight produced
+three pending messages, all firing within minutes of each other.
+
+**Pattern:** `trip-sync.py` has a `cancel_outbox_by_ids()` helper called on
+every path that orphans an outbox pointer: data-changed update, removed-from-
+manifest cleanup, hotel DELETE+INSERT, and the new reservation removal path.
+Old messages are cancelled by specific ID *before* the trip-side pointer is
+cleared.
+
+### 5. LLM plans, code delivers
+
+The foundational principle of this repo. Restated because every other pattern
+here exists to enforce it:
+
+- **LLM side:** extracting structured data from unstructured input (email,
+  messages, user questions), composing message bodies, deciding what to do.
+- **Code side:** polling, delivery, database writes, scheduling, state
+  transitions, dedup, cleanup.
+
+Every place we violated this — cron LLMs polling flight status, LLMs writing
+messages directly to iMessage, LLMs deciding when crons were "done" — broke in
+production. The outbox, the flight monitor daemon, the trip database CLI all
+exist because an LLM was previously doing that job and doing it badly.
+
+---
+
 ## ClawHub Credits
 
 Several components were built on top of skills from the [ClawHub](https://clawhub.com) marketplace:

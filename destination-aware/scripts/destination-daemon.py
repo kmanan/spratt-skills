@@ -38,7 +38,7 @@ CONTEXT_SCRIPT = os.path.expanduser(
 OUTBOX_CLI = os.path.expanduser(
     "~/.config/spratt/infrastructure/outbox/outbox.py"
 )
-MANAN = "+1XXXXXXXXXX"  # Replace with your phone number
+MANAN = "Manan"  # resolved by outbox.py via contacts.sqlite; use your alias here
 ENTITY_ID = "sensor.maha_tesla_destination"
 STATE_FILE = os.path.expanduser(
     "~/.config/spratt/infrastructure/destination/last-handled.json"
