@@ -16,6 +16,21 @@ When you set a destination in your Tesla, a daemon detects it instantly via Home
 
 **Destination → matching reminder → text. No match → silence.** Every category branch (grocery, daycare, pharmacy, medical, home, work, restaurant) applies the same rule: if the filter returns nothing, the daemon stays silent. "Silent" is an outcome, never a tag.
 
+## Temporal gate
+
+Before any keyword/LLM filter runs, every reminder is passed through a **temporal gate** keyed off its `dueDate` (ISO 8601, fetched via `remindctl --json`):
+
+| Reminder state | Gate decision |
+|---|---|
+| Completed | drop |
+| No due date | keep (undated → always eligible) |
+| Due today or overdue (not completed) | keep |
+| Due tomorrow or later | drop |
+
+This is what makes recurring reminders work without EventKit recurrence introspection. Apple Reminders auto-advances the next-instance `dueDate` when you complete one, so a weekly-Monday "Take Sriram's blanket to daycare" reminder has `dueDate = next Monday 07:30`. Any non-Monday daycare trip sees a future-dated reminder and the gate drops it. On Monday morning, `dueDate = today`, the gate keeps it, and the daycare keyword filter fires it.
+
+Overdue reminders keep firing on every relevant trip until you tick them off — intentional, because you haven't yet done the thing.
+
 ## How It Works
 
 ```
@@ -38,6 +53,10 @@ goplaces search (Google Places API) → identifies place type
   - Falls back to "place at ADDRESS" trick for raw addresses
         ↓
 Categorizes: grocery | daycare | pharmacy | medical | home | work | restaurant | uncategorized
+        ↓
+Fetch reminders (remindctl --json) — structured list with dueDate
+        ↓
+Temporal gate: drop completed + future-dated; keep overdue + due-today + undated
         ↓
 Compose-time relevance filter — stay silent if nothing matches:
   - Grocery → Shared reminder list → Haiku keeps only grocery-cart items
@@ -131,6 +150,7 @@ These issues were discovered during production deployment and are already handle
 | **Phone numbers hardcoded in scripts** | The daemon and related tools had literal `+1XXX…` strings and a git history that leaked them | All recipient fields route through contacts aliases (e.g. `"Manan"`, `"Wife"`) — `outbox.py::_resolve_recipient` hits `~/.config/spratt/infrastructure/contacts/contacts.sqlite` at send time. No numbers in source. |
 | **Generic Tesla favorites ("Work", "Home") resolve to random nearby businesses** | Nav to "Work" produced `🏥 Heading to Any Lab Test Now` — Google Places did a coord-biased search at the work address and returned the nearest categorized business (a national lab chain ~500m away) | `known-destinations.json` is consulted before goplaces. Case-insensitive substring match, longest-key-wins. Hits skip Google entirely and use the local category. "Work"/"Home"/"Office" map to their own categories; nav fires only if a reminder mentions the destination. |
 | **Medical/restaurant branches fired unconditionally** | `🏥 Heading to X` + calendar text on every medical classification, even with no relevant reminder or appointment | Every category branch now follows the uniform rule: keyword-filter reminders (or LLM-filter for grocery), stay silent if nothing matches. "Silent" is an outcome, never a destination tag. |
+| **Recurring reminders fired every trip, not just on their scheduled day** | "Take Sriram's blanket to daycare" (weekly Monday 7:30am) fired on Tue/Wed/Thu daycare trips too, because keyword match doesn't know about dueDate | Added a temporal gate that runs before the keyword/LLM filter. Uses `remindctl --json` to get structured `dueDate`, drops reminders whose dueDate is in the future (tomorrow or later). Relies on Apple Reminders auto-advancing the next-instance dueDate when a recurring reminder is completed. remindctl doesn't expose EventKit recurrence rules, but the next dueDate is sufficient. |
 
 ## Why WebSocket, not SSE
 

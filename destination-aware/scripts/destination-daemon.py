@@ -27,6 +27,7 @@ import os
 import subprocess
 import time
 import urllib.request
+from datetime import datetime
 from threading import Event, Lock
 
 import websocket
@@ -170,15 +171,39 @@ def gather_context(destination, lat=None, lng=None, known=None):
         return None
 
 
-def _parse_open_reminders(reminders_text):
-    """Extract open reminder text (stripping '[ ]' and trailing '[tags]')."""
+def _parse_iso(s):
+    """Parse an ISO-8601 timestamp. Python 3.9's fromisoformat chokes on the 'Z' suffix."""
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
+def _eligible_titles(items):
+    """Temporal gate: return titles of reminders that are open AND either undated
+    or due today / overdue in local time. Future-dated reminders are dropped.
+
+    Context (Issue #3): the blanket reminder with dueDate=next Monday should NOT
+    fire on a Wednesday daycare trip. Apple Reminders auto-advances the next
+    recurring instance's dueDate when you complete one, so filtering on the
+    single upcoming dueDate handles weekly/daily/monthly recurrence without
+    needing EventKit recurrence rules (which remindctl doesn't expose anyway).
+    """
+    now_local = datetime.now().astimezone()
+    end_of_today = now_local.replace(hour=23, minute=59, second=59, microsecond=999999)
     out = []
-    for line in (reminders_text or "").split("\n"):
-        if "[ ]" not in line:
+    for r in items or []:
+        if not isinstance(r, dict) or r.get("isCompleted"):
             continue
-        parts = line.split("[ ] ", 1)
-        if len(parts) > 1:
-            out.append(parts[1].split(" [")[0].strip())
+        due = r.get("dueDate")
+        if due:
+            try:
+                if _parse_iso(due) > end_of_today:
+                    continue
+            except (ValueError, TypeError):
+                pass  # unparseable → treat as undated, pass through
+        title = (r.get("title") or "").strip()
+        if title:
+            out.append(title)
     return out
 
 
@@ -244,21 +269,15 @@ def llm_filter_grocery(items, place):
         return None
 
 
-def _filter_by_keywords(reminders_text, keywords):
-    """Return open-reminder texts that contain any keyword (case-insensitive)."""
+def _match_keywords(titles, keywords):
+    """Filter a list of titles to those containing any keyword (case-insensitive)."""
     kws = [k.lower().strip() for k in keywords if k and k.strip()]
     if not kws:
         return []
-    out = []
-    for item in _parse_open_reminders(reminders_text):
-        low = item.lower()
-        if any(kw in low for kw in kws):
-            out.append(item)
-    return out
+    return [t for t in titles if any(kw in t.lower() for kw in kws)]
 
 
-# Uniform rule across every branch: if no relevant reminder matches, stay silent.
-# Destination -> corresponding reminder -> text. No match -> nothing.
+# Uniform rule: destination → matching reminder → text. No match → silence.
 BRANCHES = [
     # (category, emoji, keyword list, include place name as keyword)
     ("daycare",    "🏫", ["sriram", "daycare", "preschool", "bright horizons",
@@ -270,32 +289,32 @@ BRANCHES = [
     ("medical",    "🏥", ["doctor", "appointment", "checkup", "consultation", "ask about"], True),
     ("home",       "🏠", ["home"], True),
     ("work",       "💼", ["work", "office"], True),
-    ("restaurant", "🍽", [], True),  # match only on place name — generic restaurant keywords are too broad
+    ("restaurant", "🍽", [], True),  # place name only — generic restaurant keywords are too broad
 ]
 
 
 def compose_message(context):
     place = context.get("place_name", "Unknown")
     categories = context.get("categories", [])
-    reminders = context.get("reminders", "")
+    # Temporal gate runs once up front — future-dated reminders never reach a branch.
+    eligible = _eligible_titles(context.get("reminders"))
 
     # Grocery gets its own LLM-filter path (more permissive than keyword match).
     if "grocery" in categories:
-        open_items = _parse_open_reminders(reminders)
-        picked = llm_filter_grocery(open_items, place)
+        picked = llm_filter_grocery(eligible, place)
         if picked:
             return f"🛒 Heading to {place}\nShopping list: {', '.join(picked)}"
         # None (LLM failed) or [] (nothing grocery-relevant) → silent
         return None
 
-    # Every other branch: keyword-filter reminders, stay silent if nothing matches.
+    # Every other branch: keyword-match eligible titles, stay silent if empty.
     for category, emoji, keywords, include_place in BRANCHES:
         if category not in categories:
             continue
         kws = list(keywords)
         if include_place and place and place.lower() != "unknown":
             kws.append(place.lower())
-        matches = _filter_by_keywords(reminders, kws)
+        matches = _match_keywords(eligible, kws)
         if matches:
             return f"{emoji} Heading to {place}\nDon't forget: {', '.join(matches[:5])}"
         return None  # category matched but no reminder matched — silent

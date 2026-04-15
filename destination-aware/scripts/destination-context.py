@@ -115,23 +115,33 @@ def categorize(place_types):
 
 
 def get_reminders(categories):
-    """Fetch relevant reminders based on destination category."""
-    parts = []
+    """Fetch reminders from relevant lists as a structured list.
+
+    Returns a list of dicts: {title, dueDate (optional ISO), listName, isCompleted}.
+    The daemon applies the temporal gate + category filter downstream.
+    """
     if "grocery" in categories:
-        # Grocery: only Shared list (household shopping items)
         lists_to_check = ["Shared"]
-    elif "daycare" in categories:
-        # Daycare: all lists (could be kid-related items anywhere)
-        lists_to_check = REMINDER_LISTS
     else:
-        # Everything else: all lists
         lists_to_check = REMINDER_LISTS
 
+    all_items = []
     for lst in lists_to_check:
-        code, out, _ = run(f"/opt/homebrew/bin/remindctl show all --list {lst}")
-        if code == 0 and out and out != "(none)" and "No reminders found" not in out:
-            parts.append(f"{lst} list:\n{out}")
-    return "\n\n".join(parts) if parts else None
+        code, out, _ = run(f"/opt/homebrew/bin/remindctl show all --list {lst} --json")
+        if code != 0 or not out:
+            continue
+        try:
+            items = json.loads(out)
+        except json.JSONDecodeError:
+            continue
+        for it in items:
+            all_items.append({
+                "title": it.get("title", ""),
+                "dueDate": it.get("dueDate"),  # ISO 8601 or None
+                "listName": it.get("listName", lst),
+                "isCompleted": bool(it.get("isCompleted", False)),
+            })
+    return all_items
 
 
 def get_calendar_today():
