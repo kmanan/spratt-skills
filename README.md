@@ -144,14 +144,14 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 
 ### 10. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
 
-When you set a destination in your Tesla, this daemon detects it via Home Assistant's SSE stream and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know.
+When you set a destination in your Tesla, this daemon detects it via Home Assistant's WebSocket `subscribe_trigger` and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know. Grocery lists are filtered through Haiku so unrelated todos don't get dumped into the message.
 
 **Why it exists:** "Bring diapers to daycare" sitting in a reminder list doesn't help if you only see it at 7am and forget by 5pm pickup. The reminder should surface when you're actually heading there.
 
 | | |
 |---|---|
-| **What you get** | destination-daemon.py (persistent SSE listener), destination-context.py (place resolver + context gatherer), SKILL.md |
-| **Dependencies** | Python 3, Home Assistant with Tesla integration, [goplaces](https://github.com/openclaw/goplaces) CLI (Google Places API), Outbox (above) |
+| **What you get** | destination-daemon.py (persistent WebSocket client with triple liveness), destination-context.py (place resolver + context gatherer), SKILL.md |
+| **Dependencies** | Python 3, `websocket-client` pip package, Home Assistant with Tesla integration, [goplaces](https://github.com/openclaw/goplaces) CLI (Google Places API), Outbox (above), `ANTHROPIC_API_KEY` in the daemon's plist EnvironmentVariables for the grocery LLM filter |
 | **Schedule** | Persistent daemon. Reacts instantly when Tesla nav destination is set. Zero polling. |
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~10 minutes (after Outbox is set up). See [destination-aware/README.md](./destination-aware/README.md) for deployment gotchas. |
@@ -252,11 +252,16 @@ Human → "plan meals this week"
 
 Tesla nav destination set → sensor.maha_tesla_destination changes
                     ↓
-              destination-daemon.py (SSE listener, instant)
+              destination-daemon.py (WebSocket subscriber, instant)
                     ↓
               goplaces resolve → identify place (grocery? daycare? doctor?)
                     ↓
-              remindctl + icalBuddy → relevant context
+              remindctl + icalBuddy → candidate context
+                    ↓
+              compose filter:
+                grocery → Haiku keeps only grocery-cart items (no "drop off at X", no work todos)
+                daycare → keyword filter against kid/daycare terms + the resolved place name
+                else    → stay silent if nothing matches
                     ↓
               outbox.sqlite → sender.py → "🛒 Heading to QFC — cilantro, milk, paper towels"
 

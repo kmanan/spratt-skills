@@ -28,11 +28,15 @@ goplaces search (Google Places API) → identifies place type
         ↓
 Categorizes: grocery | daycare | medical | restaurant | unknown
         ↓
-Fetches relevant context:
-  - Grocery → Shared reminder list only (not personal todos)
-  - Daycare → All reminder lists
+Fetches candidate context + compose-time relevance filter:
+  - Grocery → Shared reminder list → Haiku keeps only grocery-cart items
+              (excludes "drop off at X", "for Sriram", work todos, etc.)
+  - Daycare → All reminder lists → keyword filter against kid/daycare
+              terms (sriram, diaper, bottle, blanket, pickup, etc.) plus
+              the resolved place name
   - Medical → Calendar events at matching location
   - Unknown → stays silent
+  - In any category: if nothing relevant remains after filtering, stay silent
         ↓
 Sends one text via outbox before you arrive
 ```
@@ -46,6 +50,7 @@ Sends one text via outbox before you arrive
 - Outbox (for message delivery)
 - `remindctl` (for Apple Reminders access)
 - Python `websocket-client` library (`pip install --user websocket-client`)
+- `ANTHROPIC_API_KEY` — required to filter grocery reminders to actual cart items (uses Haiku). If unset, the grocery branch stays silent instead of dumping every open reminder.
 - macOS (for launchd daemon)
 
 ### Install
@@ -67,6 +72,10 @@ EOF
 #    IMPORTANT: Include these environment variables in the plist:
 #    - PATH: /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 #    - GOOGLE_PLACES_API_KEY: your key
+#    - ANTHROPIC_API_KEY: your key (for the grocery LLM filter)
+#      launchd does NOT inherit your shell env (~/.zshrc etc.), so the
+#      key must be set inside the plist or the daemon will silently
+#      stay silent on every grocery trip.
 
 # 4. Load the daemon
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.spratt.destination-daemon.plist
@@ -100,7 +109,9 @@ These issues were discovered during production deployment and are already handle
 | **Event stream silently wedges** | Process stays alive and TCP is fine, but state_changed events never arrive — a structural zombie | **Triple liveness:** (1) app-layer `{"type":"ping"}` every 30s expecting `pong` within 10s, (2) REST sanity check every 5min comparing `/api/states/<entity>.last_changed` against last WS-delivered timestamp, (3) heartbeat file touched every loop tick — `spratt-health` alerts if stale >120s. Any check failure tears down the socket and reconnects with exponential backoff. |
 | **Short place names** | "QFC" without location returns wrong/no result | Fetch destination coords from `device_tracker.maha_tesla_route` for location-biased search |
 | **Raw addresses** | Google returns "premise" type, not business | "place at ADDRESS" prefix trick resolves to the business at that address |
-| **All reminders dumped** | Grocery trip shows "set up Resy" and other irrelevant todos | Grocery destinations only check Shared list, not personal lists |
+| **Grocery trip dumps unrelated todos** | "🛒 Heading to QFC — set up Resy, research AI thing, bring diapers for Sriram…" — unrelated reminders land in the grocery message | `compose_message` grocery branch used to fall back to "first 5 open items from Shared" whenever it couldn't find a dead-code `Shopping list:` section (which doesn't exist on real Reminders setups). Now: parse all open Shared items, pass them through Haiku with a tight prompt ("pick only grocery-cart items; exclude anything tagged to another destination/person or work todos"), and stay silent if the LLM fails or nothing qualifies. Requires `ANTHROPIC_API_KEY` in the plist. |
+| **Daycare trip dumps unrelated todos** | Same as above but for "🏫 Heading to Bright Horizons" — daycare trips were first-5-ing every open reminder across Manan/Harshita/Shared | Daycare branch now keyword-filters against a fixed list (`sriram`, `daycare`, `bright horizons`, `diaper`, `bottle`, `blanket`, `pickup`, `drop-off`, `nap`, `formula`, `snack`, `lunch box`, `tuition`, `permission slip`, `sign-in`) plus the resolved place name. Stays silent if nothing matches — no keyword list is used as the "all grocery items" catch-all because keyword filtering for food is endless; only daycare uses it. |
+| **Phone numbers hardcoded in scripts** | The daemon and related tools had literal `+1XXX…` strings and a git history that leaked them | All recipient fields route through contacts aliases (e.g. `"Manan"`, `"Wife"`) — `outbox.py::_resolve_recipient` hits `~/.config/spratt/infrastructure/contacts/contacts.sqlite` at send time. No numbers in source. |
 
 ## Why WebSocket, not SSE
 
