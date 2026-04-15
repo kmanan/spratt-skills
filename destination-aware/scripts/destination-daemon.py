@@ -38,7 +38,7 @@ CONTEXT_SCRIPT = os.path.expanduser(
 OUTBOX_CLI = os.path.expanduser(
     "~/.config/spratt/infrastructure/outbox/outbox.py"
 )
-MANAN = "Manan"  # resolved by outbox.py via contacts.sqlite; use your alias here
+MANAN = "Manan"  # resolved by outbox.py via contacts.sqlite (infrastructure/contacts)
 ENTITY_ID = "sensor.maha_tesla_destination"
 STATE_FILE = os.path.expanduser(
     "~/.config/spratt/infrastructure/destination/last-handled.json"
@@ -166,15 +166,39 @@ def compose_message(context):
                 lines.append(f"Reminders: {', '.join(open_reminders[:5])}")
 
     elif "daycare" in categories:
-        lines.append(f"🏫 Heading to {place}")
-        open_reminders = []
+        # Filter reminders to ones actually relevant to daycare/the child.
+        # All reminder lists were queried (grocery/household items can live
+        # in Manan's personal list), but we must NOT surface unrelated todos
+        # like "Set up Resy" or "Research Reflection AI" just because they
+        # happen to be open.
+        daycare_keywords = [
+            "sriram", "daycare", "preschool", "bright horizons",
+            "pickup", "drop off", "drop-off", "dropoff",
+            "diaper", "bottle", "blanket", "nap", "formula",
+            "snack", "lunch box", "lunchbox", "tuition",
+            "permission slip", "sign-in", "sign in",
+        ]
+        # Also treat the resolved place name as a keyword (e.g. "Bright Horizons")
+        place_kw = place.lower().strip()
+        if place_kw and place_kw != "unknown":
+            daycare_keywords.append(place_kw)
+
+        relevant = []
         for line in reminders.split("\n"):
-            if "[ ]" in line:
-                parts = line.split("[ ] ", 1)
-                if len(parts) > 1:
-                    open_reminders.append(parts[1].split(" [")[0].strip())
-        if open_reminders:
-            lines.append(f"Don't forget: {', '.join(open_reminders[:5])}")
+            if "[ ]" not in line:
+                continue
+            parts = line.split("[ ] ", 1)
+            if len(parts) <= 1:
+                continue
+            text = parts[1].split(" [")[0].strip()
+            text_lower = text.lower()
+            if any(kw in text_lower for kw in daycare_keywords):
+                relevant.append(text)
+
+        if relevant:
+            lines.append(f"🏫 Heading to {place}")
+            lines.append(f"Don't forget: {', '.join(relevant[:5])}")
+        # No relevant reminders → stay silent (don't spam unrelated todos)
 
     elif "medical" in categories:
         lines.append(f"🏥 Heading to {place}")
