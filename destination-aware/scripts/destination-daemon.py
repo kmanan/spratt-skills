@@ -135,6 +135,80 @@ def gather_context(destination, lat=None, lng=None):
         return None
 
 
+def _parse_open_reminders(reminders_text):
+    """Extract open reminder text (stripping '[ ]' and trailing '[tags]')."""
+    out = []
+    for line in (reminders_text or "").split("\n"):
+        if "[ ]" not in line:
+            continue
+        parts = line.split("[ ] ", 1)
+        if len(parts) > 1:
+            out.append(parts[1].split(" [")[0].strip())
+    return out
+
+
+def llm_filter_grocery(items, place):
+    """Ask Haiku which items are grocery-relevant.
+
+    Returns the filtered subset, or None if the LLM call failed / key missing.
+    Callers should stay silent on None — better silence than dumping noise.
+    """
+    if not items:
+        return []
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        log.warning("ANTHROPIC_API_KEY not set; skipping grocery LLM filter")
+        return None
+
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(items))
+    user_content = (
+        f"Destination: {place} (a grocery store).\n"
+        f"Reminders (open):\n{numbered}\n\n"
+        f"Pick ONLY reminders that are general grocery-shopping items to add to the cart — "
+        f"food, drinks, household consumables bought during a routine shop. "
+        f"EXCLUDE items that reference another destination, person, or delivery target "
+        f'(e.g. "bring X for Sriram", "drop off at daycare", "take to work"), '
+        f"even if the item itself is sold at the store. "
+        f"EXCLUDE work/project todos, research tasks, setup tasks, and anything that isn't "
+        f"something you physically pick up off a grocery shelf. "
+        f'Return ONLY JSON: {{"indices": [<1-based ints>]}}. '
+        f'If none match, return {{"indices": []}}.'
+    )
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": user_content}],
+    }
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+        result = json.loads(resp.read())
+        text = result["content"][0]["text"].strip()
+        if text.startswith("```"):
+            text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```")).strip()
+        # Tolerate prose around the JSON — pull the first balanced {...}
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            text = text[start:end + 1]
+        parsed = json.loads(text)
+        indices = parsed.get("indices", [])
+        picked = [items[i - 1] for i in indices if isinstance(i, int) and 1 <= i <= len(items)]
+        return picked
+    except Exception as e:
+        log.warning(f"Grocery LLM filter failed: {e}")
+        return None
+
+
 def compose_message(context):
     place = context.get("place_name", "Unknown")
     categories = context.get("categories", [])
@@ -143,27 +217,12 @@ def compose_message(context):
     lines = []
 
     if "grocery" in categories:
-        shopping_items = []
-        if "Shopping list:" in reminders:
-            shopping_section = reminders.split("Shopping list:\n")[1].split("\n\n")[0]
-            for line in shopping_section.strip().split("\n"):
-                if "[ ]" in line:
-                    parts = line.split("[ ] ", 1)
-                    if len(parts) > 1:
-                        shopping_items.append(parts[1].split(" [")[0].strip())
-            if shopping_items:
-                lines.append(f"🛒 Heading to {place}")
-                lines.append(f"Shopping list: {', '.join(shopping_items)}")
-        if not shopping_items:
-            open_reminders = []
-            for line in reminders.split("\n"):
-                if "[ ]" in line:
-                    parts = line.split("[ ] ", 1)
-                    if len(parts) > 1:
-                        open_reminders.append(parts[1].split(" [")[0].strip())
-            if open_reminders:
-                lines.append(f"🛒 Heading to {place}")
-                lines.append(f"Reminders: {', '.join(open_reminders[:5])}")
+        open_items = _parse_open_reminders(reminders)
+        picked = llm_filter_grocery(open_items, place)
+        if picked:
+            lines.append(f"🛒 Heading to {place}")
+            lines.append(f"Shopping list: {', '.join(picked)}")
+        # picked is None (LLM failed) or [] (nothing relevant) → stay silent
 
     elif "daycare" in categories:
         # Filter reminders to ones actually relevant to daycare/the child.
