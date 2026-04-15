@@ -46,6 +46,9 @@ STATE_FILE = os.path.expanduser(
 HEARTBEAT_FILE = os.path.expanduser(
     "~/.config/spratt/infrastructure/destination/.heartbeat"
 )
+KNOWN_DESTINATIONS_FILE = os.path.expanduser(
+    "~/.config/spratt/infrastructure/destination/known-destinations.json"
+)
 
 PING_INTERVAL = 30       # send app-layer ping every N seconds
 PONG_TIMEOUT = 10        # require pong within N seconds
@@ -116,12 +119,44 @@ def rest_destination_coords(ha_url: str, ha_token: str):
     return None, None
 
 
-# --- Context pipeline (unchanged from previous daemon) ---
+# --- Context pipeline ---
 
-def gather_context(destination, lat=None, lng=None):
+def lookup_known(destination):
+    """Match destination against known-destinations.json.
+
+    Case-insensitive substring match, longest key wins so that
+    'Bright Horizons at Woodinville' matches 'bright horizons' rather
+    than accidentally hitting a shorter key.
+
+    Returns {"name": str, "categories": [str, ...]} or None.
+    """
+    try:
+        with open(KNOWN_DESTINATIONS_FILE) as f:
+            table = json.load(f).get("destinations", {})
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        log.warning(f"known-destinations.json unavailable: {e}")
+        return None
+
+    dest_lower = (destination or "").lower()
+    best_key = None
+    for key in table:
+        if key in dest_lower and (best_key is None or len(key) > len(best_key)):
+            best_key = key
+    if best_key is None:
+        return None
+    entry = table[best_key]
+    return {"name": entry.get("name", best_key.title()), "categories": entry.get("categories", [])}
+
+
+def gather_context(destination, lat=None, lng=None, known=None):
     try:
         cmd = ["/usr/bin/python3", CONTEXT_SCRIPT, "--destination", destination]
-        if lat and lng:
+        if known:
+            cmd.extend([
+                "--known-name", known["name"],
+                "--known-categories", ",".join(known["categories"]),
+            ])
+        elif lat and lng:
             cmd.extend(["--lat", str(lat), "--lng", str(lng)])
         env = os.environ.copy()
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -209,67 +244,63 @@ def llm_filter_grocery(items, place):
         return None
 
 
+def _filter_by_keywords(reminders_text, keywords):
+    """Return open-reminder texts that contain any keyword (case-insensitive)."""
+    kws = [k.lower().strip() for k in keywords if k and k.strip()]
+    if not kws:
+        return []
+    out = []
+    for item in _parse_open_reminders(reminders_text):
+        low = item.lower()
+        if any(kw in low for kw in kws):
+            out.append(item)
+    return out
+
+
+# Uniform rule across every branch: if no relevant reminder matches, stay silent.
+# Destination -> corresponding reminder -> text. No match -> nothing.
+BRANCHES = [
+    # (category, emoji, keyword list, include place name as keyword)
+    ("daycare",    "🏫", ["sriram", "daycare", "preschool", "bright horizons",
+                          "pickup", "drop off", "drop-off", "dropoff",
+                          "diaper", "bottle", "blanket", "nap", "formula",
+                          "snack", "lunch box", "lunchbox", "tuition",
+                          "permission slip", "sign-in", "sign in"], True),
+    ("pharmacy",   "💊", ["pharmacy", "prescription", "refill", "rx", "medication"], True),
+    ("medical",    "🏥", ["doctor", "appointment", "checkup", "consultation", "ask about"], True),
+    ("home",       "🏠", ["home"], True),
+    ("work",       "💼", ["work", "office"], True),
+    ("restaurant", "🍽", [], True),  # match only on place name — generic restaurant keywords are too broad
+]
+
+
 def compose_message(context):
     place = context.get("place_name", "Unknown")
     categories = context.get("categories", [])
     reminders = context.get("reminders", "")
-    calendar = context.get("calendar_today", "")
-    lines = []
 
+    # Grocery gets its own LLM-filter path (more permissive than keyword match).
     if "grocery" in categories:
         open_items = _parse_open_reminders(reminders)
         picked = llm_filter_grocery(open_items, place)
         if picked:
-            lines.append(f"🛒 Heading to {place}")
-            lines.append(f"Shopping list: {', '.join(picked)}")
-        # picked is None (LLM failed) or [] (nothing relevant) → stay silent
+            return f"🛒 Heading to {place}\nShopping list: {', '.join(picked)}"
+        # None (LLM failed) or [] (nothing grocery-relevant) → silent
+        return None
 
-    elif "daycare" in categories:
-        # Filter reminders to ones actually relevant to daycare/the child.
-        # All reminder lists were queried (grocery/household items can live
-        # in Manan's personal list), but we must NOT surface unrelated todos
-        # like "Set up Resy" or "Research Reflection AI" just because they
-        # happen to be open.
-        daycare_keywords = [
-            "sriram", "daycare", "preschool", "bright horizons",
-            "pickup", "drop off", "drop-off", "dropoff",
-            "diaper", "bottle", "blanket", "nap", "formula",
-            "snack", "lunch box", "lunchbox", "tuition",
-            "permission slip", "sign-in", "sign in",
-        ]
-        # Also treat the resolved place name as a keyword (e.g. "Bright Horizons")
-        place_kw = place.lower().strip()
-        if place_kw and place_kw != "unknown":
-            daycare_keywords.append(place_kw)
+    # Every other branch: keyword-filter reminders, stay silent if nothing matches.
+    for category, emoji, keywords, include_place in BRANCHES:
+        if category not in categories:
+            continue
+        kws = list(keywords)
+        if include_place and place and place.lower() != "unknown":
+            kws.append(place.lower())
+        matches = _filter_by_keywords(reminders, kws)
+        if matches:
+            return f"{emoji} Heading to {place}\nDon't forget: {', '.join(matches[:5])}"
+        return None  # category matched but no reminder matched — silent
 
-        relevant = []
-        for line in reminders.split("\n"):
-            if "[ ]" not in line:
-                continue
-            parts = line.split("[ ] ", 1)
-            if len(parts) <= 1:
-                continue
-            text = parts[1].split(" [")[0].strip()
-            text_lower = text.lower()
-            if any(kw in text_lower for kw in daycare_keywords):
-                relevant.append(text)
-
-        if relevant:
-            lines.append(f"🏫 Heading to {place}")
-            lines.append(f"Don't forget: {', '.join(relevant[:5])}")
-        # No relevant reminders → stay silent (don't spam unrelated todos)
-
-    elif "medical" in categories:
-        lines.append(f"🏥 Heading to {place}")
-        if calendar:
-            lines.append(f"Today's calendar:\n{calendar[:200]}")
-
-    elif "restaurant" in categories:
-        lines.append(f"🍽 Heading to {place}")
-        if calendar:
-            lines.append(f"Today's calendar:\n{calendar[:200]}")
-
-    return "\n".join(lines) if lines else None
+    return None  # no category matched — silent
 
 
 def send_outbox(body: str, source: str):
@@ -291,10 +322,15 @@ def send_outbox(body: str, source: str):
 
 def handle_destination(destination, ha_url, ha_token):
     log.info(f"Destination set: {destination}")
-    lat, lng = rest_destination_coords(ha_url, ha_token)
-    if lat:
-        log.info(f"Destination coords: {lat}, {lng}")
-    context = gather_context(destination, lat=lat, lng=lng)
+    known = lookup_known(destination)
+    if known:
+        log.info(f"Matched known destination: {known['name']} ({', '.join(known['categories'])}) — skipping goplaces")
+        context = gather_context(destination, known=known)
+    else:
+        lat, lng = rest_destination_coords(ha_url, ha_token)
+        if lat:
+            log.info(f"Destination coords: {lat}, {lng}")
+        context = gather_context(destination, lat=lat, lng=lng)
     if not context:
         log.info("No context gathered, skipping")
         return

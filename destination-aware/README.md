@@ -8,8 +8,13 @@ When you set a destination in your Tesla, a daemon detects it instantly via Home
 
 - **Nav to QFC** → "🛒 Heading to QFC — Dave's Killer Bread, cilantro, paper towels"
 - **Nav to daycare** → "🏫 Heading to Bright Horizons — Don't forget: diapers for Sriram"
-- **Nav to doctor** → "🏥 Sriram's checkup — Ask about: solid foods transition"
+- **Nav to Work**, reminder "Bring laptop charger to work" → "💼 Heading to Work — Don't forget: Bring laptop charger to work"
+- **Nav to Home**, no matching reminder → *(silence)*
 - **Nav to friend's house** → *(silence — nothing relevant to surface)*
+
+## The uniform rule
+
+**Destination → matching reminder → text. No match → silence.** Every category branch (grocery, daycare, pharmacy, medical, home, work, restaurant) applies the same rule: if the filter returns nothing, the daemon stays silent. "Silent" is an outcome, never a tag.
 
 ## How It Works
 
@@ -20,26 +25,38 @@ HA updates sensor.maha_tesla_destination (automatic, Tesla integration)
         ↓
 destination-daemon.py (WebSocket subscribe_trigger) detects state change
         ↓
+Lookup against known-destinations.json (case-insensitive, longest-key-wins)
+  - Hit? Use the local category/name directly; skip goplaces entirely.
+    Examples: "Work" → work, "QFC Woodinville" → grocery+pharmacy,
+              "Bright Horizons at Woodinville" → daycare.
+  - Miss? Fall through ↓
+        ↓
 Fetches destination coordinates from device_tracker.maha_tesla_route
         ↓
 goplaces search (Google Places API) → identifies place type
   - Uses coordinates for location-biased search ("QFC" near you, not across the country)
   - Falls back to "place at ADDRESS" trick for raw addresses
         ↓
-Categorizes: grocery | daycare | medical | restaurant | unknown
+Categorizes: grocery | daycare | pharmacy | medical | home | work | restaurant | uncategorized
         ↓
-Fetches candidate context + compose-time relevance filter:
+Compose-time relevance filter — stay silent if nothing matches:
   - Grocery → Shared reminder list → Haiku keeps only grocery-cart items
               (excludes "drop off at X", "for Sriram", work todos, etc.)
-  - Daycare → All reminder lists → keyword filter against kid/daycare
-              terms (sriram, diaper, bottle, blanket, pickup, etc.) plus
-              the resolved place name
-  - Medical → Calendar events at matching location
-  - Unknown → stays silent
-  - In any category: if nothing relevant remains after filtering, stay silent
+  - Daycare → All reminder lists → keyword filter (sriram, diaper, bottle,
+              blanket, pickup, drop-off, etc.) + the place name
+  - Pharmacy → prescription/refill/rx/medication keywords + place name
+  - Medical → doctor/appointment/checkup/ask-about keywords + place name
+  - Home → "home" keyword + place name
+  - Work → "work"/"office" keywords + place name
+  - Restaurant → place name only (generic restaurant keywords are too broad)
+  - Uncategorized → silent
         ↓
 Sends one text via outbox before you arrive
 ```
+
+Priority: `known-destinations.json` ordering controls it. For QFC with
+`["grocery", "pharmacy"]`, grocery fires first (most common). Reorder the
+JSON to change precedence.
 
 ## Setup
 
@@ -112,6 +129,8 @@ These issues were discovered during production deployment and are already handle
 | **Grocery trip dumps unrelated todos** | "🛒 Heading to QFC — set up Resy, research AI thing, bring diapers for Sriram…" — unrelated reminders land in the grocery message | `compose_message` grocery branch used to fall back to "first 5 open items from Shared" whenever it couldn't find a dead-code `Shopping list:` section (which doesn't exist on real Reminders setups). Now: parse all open Shared items, pass them through Haiku with a tight prompt ("pick only grocery-cart items; exclude anything tagged to another destination/person or work todos"), and stay silent if the LLM fails or nothing qualifies. Requires `ANTHROPIC_API_KEY` in the plist. |
 | **Daycare trip dumps unrelated todos** | Same as above but for "🏫 Heading to Bright Horizons" — daycare trips were first-5-ing every open reminder across Manan/Harshita/Shared | Daycare branch now keyword-filters against a fixed list (`sriram`, `daycare`, `bright horizons`, `diaper`, `bottle`, `blanket`, `pickup`, `drop-off`, `nap`, `formula`, `snack`, `lunch box`, `tuition`, `permission slip`, `sign-in`) plus the resolved place name. Stays silent if nothing matches — no keyword list is used as the "all grocery items" catch-all because keyword filtering for food is endless; only daycare uses it. |
 | **Phone numbers hardcoded in scripts** | The daemon and related tools had literal `+1XXX…` strings and a git history that leaked them | All recipient fields route through contacts aliases (e.g. `"Manan"`, `"Wife"`) — `outbox.py::_resolve_recipient` hits `~/.config/spratt/infrastructure/contacts/contacts.sqlite` at send time. No numbers in source. |
+| **Generic Tesla favorites ("Work", "Home") resolve to random nearby businesses** | Nav to "Work" produced `🏥 Heading to Any Lab Test Now` — Google Places did a coord-biased search at the work address and returned the nearest categorized business (a national lab chain ~500m away) | `known-destinations.json` is consulted before goplaces. Case-insensitive substring match, longest-key-wins. Hits skip Google entirely and use the local category. "Work"/"Home"/"Office" map to their own categories; nav fires only if a reminder mentions the destination. |
+| **Medical/restaurant branches fired unconditionally** | `🏥 Heading to X` + calendar text on every medical classification, even with no relevant reminder or appointment | Every category branch now follows the uniform rule: keyword-filter reminders (or LLM-filter for grocery), stay silent if nothing matches. "Silent" is an outcome, never a destination tag. |
 
 ## Why WebSocket, not SSE
 
@@ -133,4 +152,5 @@ The SSE endpoint is also undocumented/legacy — HA's documented real-time integ
 |------|---------|
 | `scripts/destination-daemon.py` | Persistent daemon — WebSocket client, orchestrator |
 | `scripts/destination-context.py` | Place resolver + context gatherer (reminders, calendar) |
+| `scripts/known-destinations.json.example` | Template mapping of Tesla nav labels to categories. Copy to `known-destinations.json` and edit for your own favorites (Home, Work, local grocery names, daycare, etc.). |
 | `SKILL.md` | OpenClaw skill definition for interactive use |

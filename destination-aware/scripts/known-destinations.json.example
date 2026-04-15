@@ -1,0 +1,14 @@
+{
+  "_comment": "Known Tesla destinations → category. Matched case-insensitive, longest key wins. 'categories' is priority-ordered; the first matching compose branch fires.",
+  "destinations": {
+    "home":            {"categories": ["home"],                "name": "Home"},
+    "work":            {"categories": ["work"],                "name": "Work"},
+    "office":          {"categories": ["work"],                "name": "Office"},
+    "costco":          {"categories": ["grocery"],             "name": "Costco"},
+    "qfc":             {"categories": ["grocery", "pharmacy"], "name": "QFC"},
+    "whole foods":     {"categories": ["grocery"],             "name": "Whole Foods"},
+    "trader joes":     {"categories": ["grocery"],             "name": "Trader Joe's"},
+    "safeway":         {"categories": ["grocery"],             "name": "Safeway"},
+    "bright horizons": {"categories": ["daycare"],             "name": "Bright Horizons"}
+  }
+}

@@ -149,17 +149,24 @@ def main():
     parser.add_argument("--destination", required=True, help="Destination address from Tesla nav")
     parser.add_argument("--lat", type=float, default=None, help="Destination latitude")
     parser.add_argument("--lng", type=float, default=None, help="Destination longitude")
+    parser.add_argument("--known-name", default=None, help="If set with --known-categories, skip goplaces and use these values")
+    parser.add_argument("--known-categories", default=None, help="Comma-separated category list (e.g. grocery,pharmacy)")
     args = parser.parse_args()
 
     destination = args.destination
 
-    # Step 1: Resolve destination
-    place = resolve_destination(destination, lat=args.lat, lng=args.lng)
-
-    place_name = place.get("name", "Unknown") if place else "Unknown"
-    place_address = place.get("address", destination) if place else destination
-    place_types = place.get("types", []) if place else []
-    categories = categorize(place_types)
+    if args.known_name and args.known_categories:
+        # Known destination — skip goplaces entirely.
+        place_name = args.known_name
+        place_address = destination
+        place_types = []
+        categories = [c.strip() for c in args.known_categories.split(",") if c.strip()]
+    else:
+        place = resolve_destination(destination, lat=args.lat, lng=args.lng)
+        place_name = place.get("name", "Unknown") if place else "Unknown"
+        place_address = place.get("address", destination) if place else destination
+        place_types = place.get("types", []) if place else []
+        categories = categorize(place_types)
 
     # Step 2: Gather context based on category
     data = {
