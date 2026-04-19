@@ -35,7 +35,9 @@ Design:
 import sys
 import os
 import re
+import json
 import sqlite3
+import subprocess
 import argparse
 from datetime import datetime, date, timezone, timedelta
 
@@ -46,7 +48,43 @@ except ImportError:
 
 # ─── Config ───
 
-TRIPS_DB = os.path.expanduser("~/.config/spratt/trips/trips.sqlite")
+TRIPS_DB = os.path.expanduser("~/.config/spratt/db/trips.sqlite")
+CONTACTS_DB = os.path.expanduser("~/.config/spratt/db/contacts.sqlite")
+OUTBOX_CLI = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.py")
+MANAN_PHONE = "+13157082088"
+
+
+def _notify_manan(body, source):
+    """Send a notification to Manan via the outbox."""
+    try:
+        subprocess.run(
+            [sys.executable, OUTBOX_CLI, "schedule",
+             "--to", MANAN_PHONE, "--body", body,
+             "--at", "now", "--source", source,
+             "--created-by", "trip-db"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        print(f"  WARNING: Could not send notification: {e}", file=sys.stderr)
+
+
+def _resolve_contact(name):
+    """Look up a name in contacts.sqlite. Returns (handle, canonical_name) or (None, None)."""
+    if not os.path.exists(CONTACTS_DB):
+        return None, None
+    try:
+        conn = sqlite3.connect(CONTACTS_DB, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT handle, canonical_name FROM contacts_lookup WHERE alias = ? COLLATE NOCASE LIMIT 1",
+            (name.strip(),),
+        ).fetchone()
+        conn.close()
+        if row:
+            return row["handle"], row["canonical_name"]
+    except Exception:
+        pass
+    return None, None
 
 
 def _sync_flight_state(trip_id):
@@ -462,6 +500,20 @@ def cmd_add_trip(args):
     print(f"  status:      {row['status']}")
     if row['group_chat_guid']:
         print(f"  group_chat:  {row['group_chat_guid']}")
+
+    if not args.group_chat:
+        name_str = args.name or args.destination or trip_id
+        dates_str = f"{args.start_date or '?'} → {args.end_date or '?'}"
+        body = (
+            f"🗺️ New trip created: {name_str}\n"
+            f"📅 {dates_str}\n\n"
+            f"Solo or group trip? Reply with:\n"
+            f"• Solo — and the traveler name (e.g. \"solo Dad\")\n"
+            f"• Group — and who's going (e.g. \"group Dad, Leo\")\n\n"
+            f"Trip ID: {trip_id}"
+        )
+        _notify_manan(body, f"trip:{trip_id}:setup")
+        print(f"  📱 Sent setup prompt to Manan")
 
 
 def cmd_add_flight(args):
@@ -903,7 +955,7 @@ def cmd_cancel_reservation(args):
     # Cancel the outbox message if one exists
     if row["outbox_msg_id"]:
         try:
-            outbox_db = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.sqlite")
+            outbox_db = os.path.expanduser("~/.config/spratt/db/outbox.sqlite")
             if not os.path.exists(outbox_db):
                 print(f"ERROR: outbox DB not found at {outbox_db}", file=sys.stderr)
                 sys.exit(2)
@@ -930,6 +982,147 @@ def cmd_cancel_reservation(args):
     print(f"  id:     {row['id']}")
     print(f"  date:   {row['date']}")
     print(f"  time:   {row['time']}")
+
+
+def cmd_setup_solo(args):
+    """Set up a solo trip: resolve traveler from contacts, add them, set group_chat_guid to their phone."""
+    conn = get_db()
+    ensure_schema(conn)
+    trip = ensure_trip_exists(conn, args.trip)
+
+    handle, canonical = _resolve_contact(args.name)
+    if not handle:
+        print(f"ERROR: Cannot find '{args.name}' in contacts. Known contacts:", file=sys.stderr)
+        if os.path.exists(CONTACTS_DB):
+            cconn = sqlite3.connect(CONTACTS_DB, timeout=5.0)
+            cconn.row_factory = sqlite3.Row
+            for r in cconn.execute("SELECT alias, handle FROM contacts_lookup WHERE kind='person' ORDER BY alias").fetchall():
+                print(f"  {r['alias']} → {r['handle']}", file=sys.stderr)
+            cconn.close()
+        sys.exit(1)
+
+    if not handle.startswith("+"):
+        print(f"ERROR: Contact '{args.name}' resolved to '{handle}' which is not a phone number.", file=sys.stderr)
+        sys.exit(1)
+
+    display_name = canonical or args.name
+
+    # Add traveler
+    conn.execute(
+        "INSERT INTO travelers (trip_id, name, phone) VALUES (?, ?, ?)",
+        (args.trip, display_name, handle),
+    )
+
+    # Update trips.travelers display column
+    travelers = conn.execute(
+        "SELECT name FROM travelers WHERE trip_id = ? ORDER BY id", (args.trip,)
+    ).fetchall()
+    traveler_list = ", ".join(t["name"] for t in travelers)
+    conn.execute(
+        "UPDATE trips SET travelers = ?, group_chat_guid = ?, updated_at = ? WHERE id = ?",
+        (traveler_list, handle, now_utc(), args.trip),
+    )
+    conn.commit()
+    conn.close()
+
+    print(f"OK: Solo trip setup complete")
+    print(f"  traveler:    {display_name} ({handle})")
+    print(f"  group_chat:  {handle}")
+    print(f"  Notifications will go to {display_name}'s phone.")
+
+
+def cmd_find_group_chat(args):
+    """Find a recently created iMessage group chat and set it on the trip."""
+    conn = get_db()
+    ensure_schema(conn)
+    trip = ensure_trip_exists(conn, args.trip)
+
+    # Get travelers for this trip
+    travelers = conn.execute(
+        "SELECT name, phone FROM travelers WHERE trip_id = ? ORDER BY id",
+        (args.trip,),
+    ).fetchall()
+
+    if not travelers:
+        print(f"ERROR: No travelers on trip '{args.trip}'. Add travelers first.", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    # List recent iMessage group chats
+    try:
+        result = subprocess.run(
+            ["imsg", "chats", "--json", "--limit", str(args.limit or 20)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            print(f"ERROR: imsg chats failed: {result.stderr}", file=sys.stderr)
+            conn.close()
+            sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Cannot run imsg: {e}", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    # Parse output — each line is a JSON object
+    group_chats = []
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            chat = json.loads(line)
+            ident = chat.get("identifier", "")
+            if "chat" in ident and ident.startswith("chat"):
+                group_chats.append(chat)
+        except json.JSONDecodeError:
+            continue
+
+    if not group_chats:
+        print("No group chats found in recent messages.", file=sys.stderr)
+        print("Ask Manan to create the group chat first, then re-run.", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    # Display group chats for selection
+    print(f"Recent group chats (trip has {len(travelers)} travelers: {', '.join(t['name'] for t in travelers)}):\n")
+    for i, chat in enumerate(group_chats):
+        display = chat.get("name") or chat.get("displayName") or "(unnamed)"
+        ident = chat.get("identifier", "")
+        participants = chat.get("participants", [])
+        p_count = len(participants) if participants else "?"
+        print(f"  [{i + 1}] {display} — {p_count} participants — {ident}")
+
+    if args.pick:
+        pick = args.pick - 1
+        if pick < 0 or pick >= len(group_chats):
+            print(f"\nERROR: --pick {args.pick} out of range (1-{len(group_chats)})", file=sys.stderr)
+            conn.close()
+            sys.exit(1)
+        chosen = group_chats[pick]
+    else:
+        # Auto-pick: if there's only one, use it
+        if len(group_chats) == 1:
+            chosen = group_chats[0]
+            print(f"\nAuto-selected the only group chat.")
+        else:
+            print(f"\nMultiple group chats found. Re-run with --pick N to select one.")
+            conn.close()
+            sys.exit(0)
+
+    guid = chosen.get("identifier", "")
+    chat_guid_value = f"chat_guid:{guid}"
+
+    conn.execute(
+        "UPDATE trips SET group_chat_guid = ?, updated_at = ? WHERE id = ?",
+        (chat_guid_value, now_utc(), args.trip),
+    )
+    conn.commit()
+    conn.close()
+
+    display = chosen.get("name") or chosen.get("displayName") or "(unnamed)"
+    print(f"\nOK: Group chat set on trip '{args.trip}'")
+    print(f"  chat:        {display}")
+    print(f"  group_chat:  {chat_guid_value}")
+    print(f"  Notifications will go to this group chat.")
 
 
 def cmd_view(args):
@@ -1018,7 +1211,7 @@ def cmd_view(args):
 
     # Pending outbox count
     try:
-        outbox_db = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.sqlite")
+        outbox_db = os.path.expanduser("~/.config/spratt/db/outbox.sqlite")
         oconn = sqlite3.connect(outbox_db)
         pending = oconn.execute(
             "SELECT COUNT(*) FROM messages WHERE trip_id = ? AND status = 'pending'",
@@ -1159,6 +1352,17 @@ def build_parser():
     p.add_argument("--trip", required=True, help="Trip ID")
     p.add_argument("--name", required=True, help="Reservation name to cancel")
 
+    # setup-solo
+    p = sub.add_parser("setup-solo", help="Set up a solo trip: resolve traveler from contacts, set phone as recipient")
+    p.add_argument("--trip", required=True, help="Trip ID")
+    p.add_argument("--name", required=True, help="Traveler name (looked up in contacts)")
+
+    # find-group-chat
+    p = sub.add_parser("find-group-chat", help="Find a recent iMessage group chat and set it on the trip")
+    p.add_argument("--trip", required=True, help="Trip ID")
+    p.add_argument("--pick", type=int, help="Select chat by number (from the displayed list)")
+    p.add_argument("--limit", type=int, default=20, help="How many recent chats to scan (default: 20)")
+
     # view
     p = sub.add_parser("view", help="Show full trip context")
     p.add_argument("--trip", required=True, help="Trip ID")
@@ -1190,6 +1394,8 @@ def main():
         "update-flight": cmd_update_flight,
         "update-reservation": cmd_update_reservation,
         "cancel-reservation": cmd_cancel_reservation,
+        "setup-solo": cmd_setup_solo,
+        "find-group-chat": cmd_find_group_chat,
         "view": cmd_view,
         "list-trips": cmd_list_trips,
     }

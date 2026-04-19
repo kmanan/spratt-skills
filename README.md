@@ -32,12 +32,14 @@ A SQLite message queue with a polling daemon. The LLM writes messages to a table
 
 The LLM writes trip data directly to SQLite through a CLI (`trip-db.py add-flight`, `add-hotel`, etc.). Outbox messages are auto-generated for flight reminders, hotel check-ins, and dinner notifications. Flight monitor state is auto-derived. Update any record, regenerate downstream — only the changed items, no full regeneration.
 
+**Setup automation:** Creating a trip automatically texts the household manager asking "solo or group?" A solo reply triggers `setup-solo` (resolves the traveler from contacts, sets their phone as the notification recipient). A group reply triggers adding travelers + `find-group-chat` (scans recent iMessage chats to discover the group GUID). No manual GUID lookups.
+
 **Why it exists:** Family travel has dozens of moving parts — flights, hotels, restaurants, Uber links, group chat notifications — spread across confirmation emails and text threads. Without structure, details get lost and nobody gets reminded. The trip manager gives the LLM a single database to write to, and deterministic scripts handle all the downstream notification scheduling and flight tracking setup.
 
 | | |
 |---|---|
-| **What you get** | trip-db.py (CLI with 11 subcommands), trip-outbox-gen.py, trip-status.py, trip-flight-state.py, SQLite schema (5 tables) |
-| **Dependencies** | Python 3, SQLite, Outbox (above) |
+| **What you get** | trip-db.py (CLI with 13 subcommands including `setup-solo` and `find-group-chat`), trip-outbox-gen.py, trip-status.py, SQLite schema (5 tables) |
+| **Dependencies** | Python 3, SQLite, Outbox (above), contacts.sqlite (for name→phone resolution) |
 | **Schedule** | N/A — CLI tools invoked on demand by the LLM or by email scanning cron. |
 | **macOS-specific** | No (all scripts are standalone CLI tools) |
 | **Setup time** | ~15 minutes (after Outbox is set up) |
@@ -144,14 +146,14 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 
 ### 10. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
 
-When you set a destination in your Tesla, this daemon detects it via Home Assistant's WebSocket `subscribe_trigger` and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know. Grocery lists are filtered through Haiku so unrelated todos don't get dumped into the message.
+When you set a destination in your Tesla, this daemon detects it via Home Assistant's WebSocket `subscribe_trigger` and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know. Every category (grocery, daycare, pharmacy, medical, home, work, restaurant) runs through Haiku with a category-specific prompt so unrelated todos don't get dumped into the message.
 
 **Why it exists:** "Bring diapers to daycare" sitting in a reminder list doesn't help if you only see it at 7am and forget by 5pm pickup. The reminder should surface when you're actually heading there.
 
 | | |
 |---|---|
 | **What you get** | destination-daemon.py (persistent WebSocket client with triple liveness), destination-context.py (place resolver + context gatherer), SKILL.md |
-| **Dependencies** | Python 3, `websocket-client` pip package, Home Assistant with Tesla integration, [goplaces](https://github.com/openclaw/goplaces) CLI (Google Places API), Outbox (above), `ANTHROPIC_API_KEY` in the daemon's plist EnvironmentVariables for the grocery LLM filter |
+| **Dependencies** | Python 3, `websocket-client` pip package, Home Assistant with Tesla integration, [goplaces](https://github.com/openclaw/goplaces) CLI (Google Places API), Outbox (above), `ANTHROPIC_API_KEY` in the daemon's plist EnvironmentVariables for per-category Haiku LLM filtering |
 | **Schedule** | Persistent daemon. Reacts instantly when Tesla nav destination is set. Zero polling. |
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~10 minutes (after Outbox is set up). See [destination-aware/README.md](./destination-aware/README.md) for deployment gotchas. |
@@ -203,9 +205,17 @@ A compiled Swift binary that creates proper recurring Apple Reminders via EventK
 ## Architecture
 
 ```
-Human → LLM → trip-db.py CLI (add-trip, add-flight, add-hotel, etc.)
+              All databases in one directory: db/
+              (trips, outbox, orders, recipes, places, contacts, cards)
+
+Human → LLM → trip-db.py add-trip
                     ↓
-              trips.sqlite (trips, flights, hotels, reservations, travelers)
+              trips.sqlite → outbox "Solo or group?" text to manager
+                    ↓
+              Manager replies → setup-solo (contacts lookup → phone)
+                              → or add-travelers + find-group-chat (imsg scan → GUID)
+                    ↓
+              trip-db.py add-flight, add-hotel, add-reservation, etc.
                     ↓
               trip-outbox-gen.py (deterministic templates)
                     ↓
@@ -213,10 +223,8 @@ Human → LLM → trip-db.py CLI (add-trip, add-flight, add-hotel, etc.)
                     ↓
               sender.py daemon (60s polling) → imsg CLI → iMessage
 
-              trip-flight-state.py → state.json
-                    ↓
               flight_monitor.py daemon (3 min polling) → FlightAware AeroAPI
-                    ↓ (on events)
+                    ↓ (reads trips.sqlite directly, no sidecar state)
               outbox.sqlite → sender.py → iMessage
 
 Human → LLM → places.sqlite (save place from URL or description)
@@ -258,10 +266,11 @@ Tesla nav destination set → sensor.maha_tesla_destination changes
                     ↓
               remindctl + icalBuddy → candidate context
                     ↓
-              compose filter:
-                grocery → Haiku keeps only grocery-cart items (no "drop off at X", no work todos)
-                daycare → keyword filter against kid/daycare terms + the resolved place name
-                else    → stay silent if nothing matches
+              compose filter (Haiku per category):
+                grocery → "pick only grocery-cart items" (no "drop off at X", no work todos)
+                daycare → "pick only daycare-relevant items" (kid supplies, forms, teacher convos)
+                pharmacy/medical/home/work/restaurant → category-specific prompt
+                no match from any category → stay silent
                     ↓
               outbox.sqlite → sender.py → "🛒 Heading to QFC — cilantro, milk, paper towels"
 
@@ -288,17 +297,27 @@ A few hard-won patterns that every component follows. These exist because we
 hit the specific failure mode each prevents, and you almost certainly will too
 if you don't adopt them.
 
-### 1. Strict file-exists guard — no silent DB auto-create
+### 1. One database directory — no scattered paths
+
+**Problem:** databases were scattered across `infrastructure/outbox/`,
+`trips/`, `orders/`, `cards/`, `infrastructure/contacts/` — no pattern. When the
+LLM agent couldn't find a database, it silently created a 0-byte file at whatever
+path it guessed, causing split-brain reads and ghost tables. This happened three
+times in two weeks.
+
+**Pattern:** all databases live in one flat directory (`db/`). Every script uses
+a hardcoded absolute path to `~/.config/spratt/db/<name>.sqlite` — no
+self-relative resolution (`__file__`-based), no symlinks, no searching. The
+canonical path table is in `TOOLS.md` (loaded on every LLM turn) and repeated
+in each skill's `SKILL.md`.
+
+### 2. Strict file-exists guard — no silent DB auto-create
 
 **Problem:** `sqlite3.connect(path)` silently creates an empty new database file
-if the path doesn't exist. Combined with `os.path.realpath(__file__)`-based path
-resolution, a stale symlink or a moved file can cause the app to create a brand
-new empty DB at the wrong path and start reading/writing to it. The real data
-sits untouched elsewhere. Split-brain, no error.
-
-This bit us in early April when 8 symlinks left after a drive migration caused
-every outbox call to silently read a stale copy of `outbox.sqlite` for hours
-before we noticed.
+if the path doesn't exist. Combined with scattered paths (now fixed by pattern 1),
+a typo or config error can cause the app to create a brand new empty DB at the
+wrong path and start reading/writing to it. The real data sits untouched
+elsewhere. Split-brain, no error.
 
 **Pattern:** every script that opens a SQLite DB checks the file exists first;
 if not, it prints a clear `FATAL` error pointing at the expected path and exits
@@ -423,15 +442,18 @@ cd spratt-skills
 cp shared/env/env.example.sh shared/env/env.sh
 # Edit env.sh with your API keys
 
+# Create the consolidated database directory
+mkdir -p ~/.config/spratt/db
+
 # 1. Start with the Outbox (everything depends on it)
 cd outbox
-cat schemas/outbox.sql | sqlite3 outbox.sqlite
+cat schemas/outbox.sql | sqlite3 ~/.config/spratt/db/outbox.sqlite
 # Edit the sender.py IMSG_BIN path for your setup
 # Install the launchd plist (see outbox/README.md)
 
 # 2. Add Trip Manager
 cd ../trip-manager
-cat schemas/trips.sql | sqlite3 trips.sqlite
+cat schemas/trips.sql | sqlite3 ~/.config/spratt/db/trips.sqlite
 # The LLM uses trip-db.py CLI to write trip data — no daemon needed
 
 # 3. Add Flight Monitor
@@ -441,7 +463,7 @@ cd ../flight-monitor
 
 # 4. Add Email-to-Orders (now with shipment tracking)
 cd ../email-to-orders
-cat schemas/orders.sql | sqlite3 orders.sqlite
+cat schemas/orders.sql | sqlite3 ~/.config/spratt/db/orders.sqlite
 # Add the email scan cron prompt to your OpenClaw cron jobs
 
 # 5. Add Instacart Orders (fills in items the email scanner can't get)
@@ -476,7 +498,7 @@ cd ../destination-aware
 
 # 10. Add Card Wallet (benefits + purchase optimizer)
 cd ../card-wallet
-cat schemas/cards.sql | sqlite3 cards.sqlite
+cat schemas/cards.sql | sqlite3 ~/.config/spratt/db/cards.sqlite
 # Seed your cards, benefits, and reward rates
 # Configure HOLDER_RECIPIENTS in card-wallet-check.py
 # Add Saturday + monthly + quarterly cron jobs to OpenClaw
@@ -510,6 +532,7 @@ Where we do use LLMs in the pipeline: Flash classifies grocery item names into c
 
 This system has been running in production for a household of 4 (2 adults, 2 kids) since late March 2026. It has managed:
 - A 5-day DC trip with 2 travelers, 4 flights, 5 restaurants, daily briefings, and real-time flight tracking
+- A solo corporate retreat trip with automated flight tracking and hotel/event notifications
 - Daily morning briefings and evening digests for 2 adults
 - Email scanning across 4 accounts (2 Gmail, 2 Outlook)
 - Smart home control via Home Assistant
@@ -517,7 +540,7 @@ This system has been running in production for a household of 4 (2 adults, 2 kid
 - Destination-aware reminders via Tesla navigation + Google Places
 - Credit card benefit tracking across 6 cards, 14 benefits, and 24 reward rate categories
 
-The system handles ~20-30 messages/day through the outbox, costs ~$0.10-0.20/day in API calls, and has had zero missed message deliveries since the outbox pattern was implemented.
+All 7 databases are consolidated into a single `db/` directory — no scattered paths, no self-relative resolution. The system handles ~20-30 messages/day through the outbox, costs ~$0.10-0.20/day in API calls, and has had zero missed message deliveries since the outbox pattern was implemented.
 
 ---
 

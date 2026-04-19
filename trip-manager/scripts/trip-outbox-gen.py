@@ -24,6 +24,10 @@ import urllib.parse
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 
+# Import outbox for message delivery (same pattern as flight_monitor.py)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "outbox"))
+from outbox import OutboxDB
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -31,11 +35,11 @@ except ImportError:
 
 # ─── Config ───
 
-TRIPS_DB = os.path.expanduser("~/.config/spratt/trips/trips.sqlite")
-OUTBOX_DB = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.sqlite")
+TRIPS_DB = os.path.expanduser("~/.config/spratt/db/trips.sqlite")
+OUTBOX_DB = os.path.expanduser("~/.config/spratt/db/outbox.sqlite")
 LOG_FILE = os.path.expanduser("~/Library/Logs/spratt/trip-outbox-gen.log")
 UBER_BASE = "https://m.uber.com/ul/?action=setPickup&pickup=my_location"
-MANAN_PHONE = "Manan"  # resolved by outbox.py via contacts.sqlite
+MANAN_PHONE = "+13157082088"
 
 
 def require_db_file(path, name):
@@ -163,7 +167,7 @@ def get_recipient(trips_conn, trip_id):
         "SELECT group_chat_guid FROM trips WHERE id = ?", (trip_id,)
     ).fetchone()
     if trip and trip["group_chat_guid"]:
-        return f"chat_guid:{trip['group_chat_guid']}"
+        return trip["group_chat_guid"]
 
     # Solo trip — find first traveler phone
     traveler = trips_conn.execute(
@@ -176,23 +180,29 @@ def get_recipient(trips_conn, trip_id):
     return MANAN_PHONE
 
 
+_outbox = None
+
+def get_outbox():
+    global _outbox
+    if _outbox is None:
+        _outbox = OutboxDB()
+    return _outbox
+
 def create_outbox_message(recipient, body, send_at_utc, source, trip_id, dry_run=False):
-    """Write a message to the outbox. Returns the message ID."""
+    """Write a message to the outbox via OutboxDB.schedule() which resolves and validates recipients."""
     if dry_run:
         log.info(f"[DRY RUN] Would create: to={recipient}, at={send_at_utc}, source={source}")
         log.info(f"  body: {body[:120]}...")
         return -1
 
-    require_db_file(OUTBOX_DB, "outbox")
-    outbox_conn = sqlite3.connect(OUTBOX_DB)
-    cur = outbox_conn.execute(
-        "INSERT INTO messages (recipient, body, send_at, source, created_by, trip_id) VALUES (?, ?, ?, ?, ?, ?)",
-        (recipient, body, send_at_utc, source, "trip-outbox-gen", trip_id),
+    return get_outbox().schedule(
+        recipient=recipient,
+        body=body,
+        send_at=send_at_utc,
+        source=source,
+        created_by="trip-outbox-gen",
+        trip_id=trip_id,
     )
-    outbox_conn.commit()
-    msg_id = cur.lastrowid
-    outbox_conn.close()
-    return msg_id
 
 
 # ─── Generation ───

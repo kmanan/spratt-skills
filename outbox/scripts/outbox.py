@@ -34,7 +34,7 @@ import sys
 import os
 from datetime import datetime, timezone, timedelta
 
-DB_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "outbox.sqlite")
+DB_PATH = os.path.expanduser("~/.config/spratt/db/outbox.sqlite")
 
 
 def require_db_file(path, name):

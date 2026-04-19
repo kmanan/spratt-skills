@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Deterministic flight monitor daemon.
+Flight monitor daemon (DB-native).
 
-Polls track_flight.py on a fixed interval, detects state changes
-(landed, delayed, diverted, gate change), and sends iMessage notifications
-via the outbox. No LLM in the loop.
+Reads active flights directly from ~/.config/spratt/db/trips.sqlite each poll cycle.
+Writes runtime state (notified_landed, was_ever_found, last_checked, gate, etc.) back
+to the same flights row. No sidecar state file.
 
-State is persisted to a JSON file so the monitor survives restarts.
+Event messages are written to the outbox SQLite; recipients are computed at send
+time by joining the trip's group_chat_guid and travelers table.
 
 Usage:
-  flight_monitor.py                          # Run with default state file
-  flight_monitor.py /path/to/state.json      # Run with custom state file
-  flight_monitor.py --once                   # Single poll cycle (for testing)
+  flight_monitor.py          # Run the daemon
+  flight_monitor.py --once   # Single poll cycle (for testing)
 """
 
 import sys
@@ -19,15 +19,37 @@ import os
 import json
 import time
 import logging
-from logging.handlers import RotatingFileHandler
+import sqlite3
 import urllib.parse
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, timedelta
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-# Airport -> IANA timezone mapping
+# Import track_flight from the same directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from track_flight import track_flight
+
+# Import outbox for message delivery
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "outbox"))
+from outbox import OutboxDB
+
+# ─── Config ───
+
+TRIPS_DB = os.path.expanduser("~/.config/spratt/db/trips.sqlite")
+LOG_FILE = os.path.expanduser("~/Library/Logs/spratt/flight-monitor.log")
+
+POLL_ACTIVE_SECONDS = 900       # 15 min when any flight is within monitoring window
+POLL_IDLE_SECONDS = 1800        # 30 min when all flights are far out
+POLL_ARRIVAL_SECONDS = 300      # 5 min when a flight is approaching landing (< 45 min out)
+MONITORING_WINDOW_HOURS = 3     # Start active polling this many hours before departure
+EXPIRE_HOURS = 12               # Stop polling this many hours after scheduled departure
+UBER_BASE = "https://m.uber.com/ul/?action=setPickup&pickup=my_location"
+
+# Airport → IANA timezone mapping (for rendering ETAs in local time)
 AIRPORT_TZ = {
     "SEA": "America/Los_Angeles", "SFO": "America/Los_Angeles", "LAX": "America/Los_Angeles",
     "PDX": "America/Los_Angeles", "SAN": "America/Los_Angeles", "SMF": "America/Los_Angeles",
@@ -44,9 +66,119 @@ AIRPORT_TZ = {
     "NRT": "Asia/Tokyo", "HND": "Asia/Tokyo", "ICN": "Asia/Seoul",
 }
 
+# Rideshare pickup instructions by airport
+AIRPORT_PICKUP = {
+    "DCA": "Follow signs to Ground Transportation. Rideshare pickup is at the garage level between Terminals A and B.",
+    "SEA": "Follow signs to the parking garage. Rideshare pickup is on the 3rd floor of the garage, accessible from any terminal.",
+    "EWR": "Follow signs to Ground Transportation. Rideshare pickup varies by terminal — check the Uber app for your exact pin.",
+    "JFK": "Follow signs to Ground Transportation. Rideshare pickup is at the terminal arrivals level curb.",
+    "IAD": "Take the AeroTrain to the parking garage. Rideshare pickup is at the Ground Transportation area.",
+    "LGA": "Follow signs to Ground Transportation. Rideshare pickup is at the arrivals level curb.",
+}
+
+# ─── Logging ───
+
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [flight-monitor] %(message)s",
+    handlers=[
+        RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger(__name__)
+
+# ─── DB helpers ───
+
+
+def db_conn():
+    """Short-lived connection to trips.sqlite with sensible concurrency defaults."""
+    if not os.path.exists(TRIPS_DB):
+        raise RuntimeError(f"trips DB missing: {TRIPS_DB}")
+    conn = sqlite3.connect(TRIPS_DB, timeout=10.0)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_active_flights():
+    """Return flights that should be considered for monitoring.
+
+    Filter: trip is upcoming/active, flight is scheduled, landing not yet notified.
+    """
+    with db_conn() as conn:
+        rows = conn.execute(
+            """SELECT f.*, t.group_chat_guid, t.name AS trip_name, t.status AS trip_status
+               FROM flights f
+               JOIN trips t ON f.trip_id = t.id
+               WHERE t.status IN ('upcoming', 'active')
+                 AND f.status = 'scheduled'
+                 AND COALESCE(f.notified_landed, 0) = 0
+               ORDER BY f.departs_utc"""
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_hotel_address_for_trip(trip_id):
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT address FROM hotels WHERE trip_id = ? LIMIT 1",
+            (trip_id,),
+        ).fetchone()
+    return row["address"] if row and row["address"] else None
+
+
+def get_primary_recipient(trip_id, group_chat_guid):
+    """Return the primary recipient string for a trip.
+
+    Group chat GUID on the trip takes precedence. Otherwise the first traveler's
+    phone (solo-trip convention: trip person gets the alert). Returns None if
+    neither is available (caller logs and skips).
+    """
+    if group_chat_guid:
+        return group_chat_guid
+    with db_conn() as conn:
+        row = conn.execute(
+            """SELECT phone FROM travelers
+               WHERE trip_id = ? AND phone IS NOT NULL
+               ORDER BY id LIMIT 1""",
+            (trip_id,),
+        ).fetchone()
+    return row["phone"] if row and row["phone"] else None
+
+
+def update_flight(flight_id, **fields):
+    """UPDATE flights row with runtime state. flight_id is the numeric PK."""
+    if not fields:
+        return
+    cols_sql = ", ".join(f"{k} = ?" for k in fields.keys())
+    vals = list(fields.values()) + [flight_id]
+    with db_conn() as conn:
+        conn.execute(
+            f"UPDATE flights SET {cols_sql}, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
+            vals,
+        )
+        conn.commit()
+
+
+# ─── Outbox helper ───
+
+_outbox = None
+
+
+def get_outbox():
+    global _outbox
+    if _outbox is None:
+        _outbox = OutboxDB()
+    return _outbox
+
+
+# ─── Formatting utils ───
+
 
 def format_local_time(utc_str, dest_iata):
-    """Convert UTC time string to local time at destination airport."""
+    """Convert UTC ISO string to local time at destination airport."""
     if not utc_str or utc_str == "unknown":
         return "unknown"
     try:
@@ -59,432 +191,386 @@ def format_local_time(utc_str, dest_iata):
         return dt.strftime("%-I:%M %p UTC")
     except Exception:
         return utc_str
-from pathlib import Path
-
-# Import track_flight from the same directory
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from track_flight import track_flight
-
-# Import outbox for message delivery
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "outbox"))
-from outbox import OutboxDB
-
-# --- Config ---
-
-DEFAULT_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-POLL_ACTIVE_SECONDS = 900       # 15 minutes when any flight is within monitoring window
-POLL_IDLE_SECONDS = 1800        # 30 minutes when all flights are far out
-POLL_ARRIVAL_SECONDS = 300      # 5 minutes when a flight is approaching landing (< 45 min out)
-MONITORING_WINDOW_HOURS = 3     # Start active polling this many hours before departure
-UBER_BASE = "https://m.uber.com/ul/?action=setPickup&pickup=my_location"
-LOG_FILE = os.path.expanduser("~/Library/Logs/spratt/flight-monitor.log")
-OWNER_PHONE = "+1XXXXXXXXXX"  # Replace with your phone number
-
-# Known airport rideshare pickup instructions
-AIRPORT_PICKUP = {
-    "DCA": "Follow signs to Ground Transportation. Rideshare pickup is at the garage level between Terminals A and B.",
-    "SEA": "Follow signs to the parking garage. Rideshare pickup is on the 3rd floor of the garage, accessible from any terminal.",
-    "EWR": "Follow signs to Ground Transportation. Rideshare pickup varies by terminal — check the Uber app for your exact pin.",
-    "JFK": "Follow signs to Ground Transportation. Rideshare pickup is at the terminal arrivals level curb.",
-    "IAD": "Take the AeroTrain to the parking garage. Rideshare pickup is at the Ground Transportation area.",
-    "LGA": "Follow signs to Ground Transportation. Rideshare pickup is at the arrivals level curb.",
-}
-
-os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [flight-monitor] %(message)s",
-    handlers=[
-        RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=3),
-        logging.StreamHandler(),
-    ],
-)
-log = logging.getLogger(__name__)
-
-# --- Message Delivery via Outbox ---
-
-_outbox = None
-
-def get_outbox():
-    global _outbox
-    if _outbox is None:
-        _outbox = OutboxDB()
-    return _outbox
 
 
-# --- Notification Templates ---
-
-def uber_link(address=None, lat=None, lng=None):
-    """Build Uber deep link. With address/coords -> specific destination. Without -> just open Uber."""
-    if address and lat and lng:
+def uber_link(address=None):
+    if address:
         encoded = urllib.parse.quote(address)
-        return f"{UBER_BASE}&dropoff[formatted_address]={encoded}&dropoff[latitude]={lat}&dropoff[longitude]={lng}"
-    # No destination — just open Uber with pickup at current location
+        return f"{UBER_BASE}&dropoff[formatted_address]={encoded}"
     return UBER_BASE
 
 
-def make_landing_message(flight_id, flight, result):
-    """Build landing notification text."""
-    dest = result.get("destination", {}) if result else {}
+def flight_label(flight):
+    """Build 'Leo EWR to SEA' style label from flight row."""
+    traveler = flight.get("traveler") or "Flight"
+    route = flight.get("route") or ""
+    if "→" in route:
+        parts = route.split("→")
+        return f"{traveler} {parts[0].strip()} to {parts[1].strip()}"
+    return f"{traveler} {route}".strip()
+
+
+# ─── Message templates ───
+
+
+def _pick_destination(flight, result):
+    """Return the destination dict, preferring live result, falling back to cached blob."""
+    dest = (result or {}).get("destination") if result else None
+    if dest:
+        return dest
+    blob = flight.get("last_result_json")
+    if blob:
+        try:
+            return (json.loads(blob) or {}).get("destination", {})
+        except Exception:
+            return {}
+    return {}
+
+
+def make_landing_message(flight, result, hotel_address):
+    dest = _pick_destination(flight, result)
     terminal = dest.get("terminal") or "?"
-    gate = dest.get("gate") or "?"
+    gate = dest.get("gate") or flight.get("gate") or "?"
     baggage = dest.get("baggage")
     dest_iata = dest.get("iata") or "?"
-    label = flight.get("label", flight_id)
+    label = flight_label(flight)
 
     lines = [f"{label} has landed at {dest_iata}!"]
     lines.append(f"Terminal {terminal}, Gate {gate}")
     if baggage:
         lines.append(f"Baggage: belt {baggage}")
 
-    # Rideshare pickup directions
     pickup_info = AIRPORT_PICKUP.get(dest_iata)
     if pickup_info:
         lines.append(f"Rideshare pickup: {pickup_info}")
 
-    # Uber link — with destination if known, otherwise just open Uber
-    hotel = flight.get("hotel_address")
-    if hotel and flight.get("hotel_lat") and flight.get("hotel_lng"):
-        lines.append(f"Uber to {hotel.split(',')[0]}: {uber_link(hotel, flight['hotel_lat'], flight['hotel_lng'])}")
+    if hotel_address:
+        lines.append(f"Uber to {hotel_address.split(',')[0]}: {uber_link(hotel_address)}")
     else:
         lines.append(f"Open Uber: {uber_link()}")
 
     return "\n".join(lines)
 
 
-def make_delay_message(flight_id, flight, result, delay_mins):
-    label = flight.get("label", flight_id)
-    eta_raw = result.get("times", {}).get("estimated_arrival") or "unknown"
-    dest_iata = result.get("destination", {}).get("iata", "")
+def make_delay_message(flight, result, delay_mins):
+    label = flight_label(flight)
+    eta_raw = (result.get("times") or {}).get("estimated_arrival") or "unknown"
+    dest_iata = (result.get("destination") or {}).get("iata", "")
     eta = format_local_time(eta_raw, dest_iata)
-    return f"\u2708\ufe0f {label} is delayed ~{delay_mins} min. New ETA: {eta}"
+    return f"✈️ {label} is delayed ~{delay_mins} min. New ETA: {eta}"
 
 
-def make_gate_change_message(flight_id, flight, result, old_gate, new_gate):
-    label = flight.get("label", flight_id)
-    dest_iata = result.get("destination", {}).get("iata", "?")
+def make_gate_change_message(flight, result, old_gate, new_gate):
+    label = flight_label(flight)
+    dest_iata = (result.get("destination") or {}).get("iata", "?")
     return f"{label}: gate changed at {dest_iata} from {old_gate} to {new_gate}"
 
 
-def make_diversion_message(flight_id, flight, result):
-    label = flight.get("label", flight_id)
-    status = result.get("status", "unknown") if result else "unknown"
-    return f"ALERT: {label} \u2014 {status}. Check immediately."
+def make_diversion_message(flight, result):
+    label = flight_label(flight)
+    status = (result or {}).get("status", "unknown")
+    return f"ALERT: {label} — {status}. Check immediately."
 
 
-# --- State Management ---
-
-def load_state(state_file, retries=3, delay=2):
-    for attempt in range(retries):
-        try:
-            with open(state_file) as f:
-                return json.load(f)
-        except FileNotFoundError:
-            log.warning(f"State file not found: {state_file}")
-            return None
-        except (PermissionError, OSError) as e:
-            if attempt < retries - 1:
-                log.warning(f"State file access error (attempt {attempt+1}/{retries}): {e}")
-                time.sleep(delay)
-            else:
-                log.error(f"State file access failed after {retries} attempts: {e}")
-                return None
+# ─── Notify: write event message to outbox ───
 
 
-def save_state(state_file, state, retries=3, delay=2):
-    tmp = state_file + ".tmp"
-    for attempt in range(retries):
-        try:
-            with open(tmp, "w") as f:
-                json.dump(state, f, indent=2)
-            os.replace(tmp, state_file)
-            return
-        except (PermissionError, OSError) as e:
-            if attempt < retries - 1:
-                log.warning(f"State file write error (attempt {attempt+1}/{retries}): {e}")
-                time.sleep(delay)
-            else:
-                log.error(f"State file write failed after {retries} attempts: {e}")
-                raise
+def notify(flight, text):
+    """Queue a flight event message to the outbox for the trip's primary recipient."""
+    recipient = get_primary_recipient(flight["trip_id"], flight.get("group_chat_guid"))
+    source = f"flight:{flight['flight_number']}"
+    if not recipient:
+        log.error(f"{flight['flight_number']}: no recipient for trip {flight['trip_id']} — message dropped")
+        get_outbox().schedule(
+            recipient="+13157082088",
+            body=f"ALERT: Flight {flight['flight_number']} (trip {flight['trip_id']}) has no notification recipient configured. Flight alerts are being dropped. Fix with: trip-db.py update-trip --id {flight['trip_id']} --group-chat <recipient>",
+            send_at="now",
+            source=f"system:no-recipient:{flight['flight_number']}",
+            created_by="flight-monitor",
+            priority=20,
+        )
+        return
+    get_outbox().schedule(
+        recipient=recipient,
+        body=text,
+        send_at="now",
+        source=source,
+        created_by="flight-monitor",
+        priority=10,
+        trip_id=flight["trip_id"],
+    )
+    log.info(f"Queued to outbox: {source} → {recipient}")
 
 
-# --- Notification Dispatch ---
-
-def notify(flight_id, flight, text):
-    """Write notification to the outbox for delivery by sender.py."""
-    db = get_outbox()
-    chat = flight.get("notify_chat")
-    also = flight.get("notify_also", [])
-    source = f"flight:{flight_id}"
-
-    if chat:
-        # Group chat exists — send there only, no individual messages
-        db.schedule(recipient=chat, body=text, send_at="now", source=source, created_by="flight-monitor", priority=10)
-        log.info(f"Queued to outbox: {source} -> chat {chat}")
-    else:
-        # No group chat — send to individual recipients
-        for target in (also or []):
-            db.schedule(recipient=target, body=text, send_at="now", source=source, created_by="flight-monitor", priority=10)
-            log.info(f"Queued to outbox: {source} -> {target}")
+def system_alert(flight, text, tag):
+    """Send an operational alert to Manan directly (not routed via trip recipients)."""
+    get_outbox().schedule(
+        recipient="+13157082088",
+        body=text,
+        send_at="now",
+        source=f"system:{tag}:{flight['flight_number']}",
+        created_by="flight-monitor",
+        priority=20,
+    )
+    log.info(f"System alert sent to Manan for {flight['flight_number']} ({tag})")
 
 
-# --- Departure Window Check ---
+# ─── Monitoring window ───
 
-EXPIRE_HOURS = 12  # Stop polling this many hours after scheduled departure
 
 def is_in_monitoring_window(flight):
-    """Check if a flight is within the active monitoring window.
-    Returns True if within MONITORING_WINDOW_HOURS before departure.
-    Returns True if was_ever_found and not yet expired (in the air).
-    Returns False if expired (departure + EXPIRE_HOURS has passed).
-    Returns True if depart_after is not set (always monitor).
-    """
-    depart_after = flight.get("depart_after")
+    """Should this flight be polled right now?"""
+    depart_after = flight.get("departs_utc")
     if not depart_after:
-        return True
-
+        log.warning(f"{flight['flight_number']}: no departs_utc — refusing to poll (would track wrong flight)")
+        return False
     try:
         dep_time = datetime.fromisoformat(depart_after.replace("Z", "+00:00"))
         if dep_time.tzinfo is None:
             dep_time = dep_time.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
 
-        # Expired — stop polling regardless
         if now > dep_time + timedelta(hours=EXPIRE_HOURS):
             return False
-
-        # Was found (in the air) — keep polling until expired
         if flight.get("was_ever_found"):
             return True
-
-        # Not yet found — only poll within the monitoring window
         window_start = dep_time - timedelta(hours=MONITORING_WINDOW_HOURS)
         return now >= window_start
     except Exception:
-        return True
+        return False
 
 
-# --- Core Poll Logic ---
+# ─── Poll logic ───
+
 
 def estimate_delay_minutes(result):
-    """Get delay in minutes. Uses API delay field, falls back to time comparison."""
-    delay = result.get("delay", {})
-    arr_delay = delay.get("arrival_minutes")
-    if arr_delay is not None and arr_delay > 0:
-        return int(arr_delay)
-    dep_delay = delay.get("departure_minutes")
-    if dep_delay is not None and dep_delay > 0:
-        return int(dep_delay)
+    """Arrival delay preferred, departure delay as fallback. Zero if neither > 0."""
+    delay = result.get("delay") or {}
+    arr = delay.get("arrival_minutes")
+    if arr is not None and arr > 0:
+        return int(arr)
+    dep = delay.get("departure_minutes")
+    if dep is not None and dep > 0:
+        return int(dep)
     return 0
 
 
-def poll_flight(flight_id, flight):
-    """Poll one flight and return list of (event_type, message) tuples."""
+def poll_flight(flight, approaching_map):
+    """Poll one flight. Returns (updates_dict, events_list).
+
+    updates_dict: fields to UPDATE on the flights row.
+    events_list: (event_type, message) tuples to dispatch.
+    """
+    updates = {"last_checked": datetime.now(timezone.utc).isoformat()}
     events = []
-    result = track_flight(flight_id)
-    now = datetime.now(timezone.utc).isoformat()
-    flight["last_checked"] = now
+    flight_num = flight["flight_number"]
+    trip_id = flight["trip_id"]
 
-    # --- Not found ---
+    result = track_flight(flight_num)
+
+    # ─── Not found ───
     if result.get("error") == "not_found":
-        flight["consecutive_not_found"] = flight.get("consecutive_not_found", 0) + 1
-        log.info(f"{flight_id}: not found (count={flight['consecutive_not_found']}, was_found={flight.get('was_ever_found')})")
+        consecutive = (flight.get("consecutive_not_found") or 0) + 1
+        updates["consecutive_not_found"] = consecutive
+        log.info(f"{flight_num}: not found (count={consecutive}, was_found={flight.get('was_ever_found')})")
 
-        # Inferred landing: was airborne, now disappeared
-        if flight.get("was_ever_found") and flight["consecutive_not_found"] >= 2 and not flight.get("notified_landed"):
-            flight["notified_landed"] = True
-            flight["last_status"] = "landed (inferred)"
-            msg = make_landing_message(flight_id, flight, flight.get("last_result"))
+        # Inferred landing: was airborne, now disappeared from radar
+        if flight.get("was_ever_found") and consecutive >= 2 and not flight.get("notified_landed"):
+            updates["notified_landed"] = 1
+            updates["last_status"] = "landed (inferred)"
+            hotel_address = get_hotel_address_for_trip(trip_id)
+            msg = make_landing_message(flight, None, hotel_address)
             events.append(("landed", msg))
-            log.info(f"{flight_id}: LANDED (inferred from disappearance)")
+            log.info(f"{flight_num}: LANDED (inferred from disappearance)")
 
-        # Alert: flight not found 1 hour after scheduled departure
-        depart_after = flight.get("depart_after")
+        # Never seen + past departure + several failed polls → operational alert
+        depart_after = flight.get("departs_utc")
         if (not flight.get("was_ever_found") and not flight.get("notified_not_found")
-                and depart_after and flight["consecutive_not_found"] >= 5):
+                and depart_after and consecutive >= 5):
             try:
                 dep_time = datetime.fromisoformat(depart_after.replace("Z", "+00:00"))
                 if dep_time.tzinfo is None:
                     dep_time = dep_time.replace(tzinfo=timezone.utc)
                 if datetime.now(timezone.utc) > dep_time + timedelta(hours=1):
-                    flight["notified_not_found"] = True
-                    label = flight.get("label", flight_id)
-                    msg = f"Warning: Flight {flight_id} ({label}) not found on FlightAware — scheduled departure was {depart_after}. Gate and landing alerts will not work. Check manually."
+                    updates["notified_not_found"] = 1
+                    label = flight_label(flight)
+                    msg = (
+                        f"⚠️ Flight {flight_num} ({label}) not found on FlightAware — "
+                        f"scheduled departure was {depart_after}. Gate and landing alerts will "
+                        f"not work. Check manually."
+                    )
                     events.append(("not_found_alert", msg))
-                    log.warning(f"{flight_id}: NOT FOUND ALERT — past departure + 1h, never seen")
+                    log.warning(f"{flight_num}: NOT FOUND ALERT")
             except Exception:
                 pass
 
-        return events
+        return updates, events
 
-    # --- API error ---
+    # ─── API error ───
     if result.get("error"):
-        log.warning(f"{flight_id}: API error: {result['error']}")
-        return events
+        log.warning(f"{flight_num}: API error: {result['error']}")
+        return updates, events
 
-    # Flight found — reset not-found counter, mark as seen
-    flight["consecutive_not_found"] = 0
-    flight["was_ever_found"] = True
-    flight["last_result"] = result
+    # ─── Flight found ───
+    updates["consecutive_not_found"] = 0
+    updates["was_ever_found"] = 1
+    updates["last_result_json"] = json.dumps(result)
 
     status_text = (result.get("status") or "").lower()
-    position = result.get("position", {})
-    dest = result.get("destination", {})
+    position = result.get("position") or {}
+    dest = result.get("destination") or {}
 
-    # --- Landed detection ---
+    # Landed detection (explicit)
     if not flight.get("notified_landed"):
         landed = False
-
         if any(kw in status_text for kw in ["landed", "arrived"]):
             landed = True
-
-        if position.get("on_ground") and position.get("altitude", 99999) < 500:
+        if position.get("on_ground") and (position.get("altitude") or 99999) < 500:
             if flight.get("last_status") in ("airborne", "descending", "en route"):
                 landed = True
-
         if landed:
-            flight["notified_landed"] = True
-            flight["last_status"] = "landed"
-            msg = make_landing_message(flight_id, flight, result)
+            updates["notified_landed"] = 1
+            updates["last_status"] = "landed"
+            hotel_address = get_hotel_address_for_trip(trip_id)
+            msg = make_landing_message(flight, result, hotel_address)
             events.append(("landed", msg))
-            log.info(f"{flight_id}: LANDED")
+            log.info(f"{flight_num}: LANDED")
 
-    # --- Delay detection ---
+    # Delay detection
     delay_mins = estimate_delay_minutes(result)
-    prev_delay = flight.get("delay_minutes_notified", 0)
+    prev_delay = flight.get("delay_minutes_notified") or 0
     if delay_mins >= 15 and delay_mins > prev_delay + 10:
-        flight["delay_minutes_notified"] = delay_mins
-        msg = make_delay_message(flight_id, flight, result, delay_mins)
+        updates["delay_minutes_notified"] = delay_mins
+        msg = make_delay_message(flight, result, delay_mins)
         events.append(("delay", msg))
-        log.info(f"{flight_id}: DELAYED {delay_mins}min")
+        log.info(f"{flight_num}: DELAYED {delay_mins}min")
 
-    # --- Diversion / cancellation ---
+    # Diversion / cancellation
     if any(kw in status_text for kw in ["diverted", "cancelled", "canceled"]):
         if not flight.get("notified_diversion"):
-            flight["notified_diversion"] = True
-            msg = make_diversion_message(flight_id, flight, result)
+            updates["notified_diversion"] = 1
+            msg = make_diversion_message(flight, result)
             events.append(("diversion", msg))
-            log.info(f"{flight_id}: DIVERTED/CANCELLED")
+            log.info(f"{flight_num}: DIVERTED/CANCELLED")
 
-    # --- Gate change ---
+    # Gate change
     new_gate = dest.get("gate")
-    old_gate = flight.get("last_gate")
+    old_gate = flight.get("gate")
     if new_gate and old_gate and new_gate != old_gate:
-        msg = make_gate_change_message(flight_id, flight, result, old_gate, new_gate)
+        msg = make_gate_change_message(flight, result, old_gate, new_gate)
         events.append(("gate_change", msg))
-        log.info(f"{flight_id}: Gate changed {old_gate} -> {new_gate}")
+        log.info(f"{flight_num}: Gate changed {old_gate} -> {new_gate}")
     if new_gate:
-        flight["last_gate"] = new_gate
+        updates["gate"] = new_gate
 
-    # --- Update status tracking ---
-    if not flight.get("notified_landed"):
-        if position.get("altitude", 0) > 5000 or "en route" in status_text:
-            flight["last_status"] = "airborne"
-        elif position.get("altitude", 0) > 500:
-            flight["last_status"] = "descending"
+    # Status progression (not landed)
+    if not updates.get("notified_landed"):
+        alt = position.get("altitude") or 0
+        if alt > 5000 or "en route" in status_text:
+            updates["last_status"] = "airborne"
+        elif alt > 500:
+            updates["last_status"] = "descending"
         elif "scheduled" in status_text or "estimated" in status_text:
-            flight["last_status"] = "pre-departure"
+            updates["last_status"] = "pre-departure"
         else:
-            flight["last_status"] = status_text[:30] or "unknown"
+            updates["last_status"] = (status_text[:30] or "unknown")
 
-    return events
+    # Approaching flag (transient, in-memory only)
+    try:
+        eta = (result.get("times") or {}).get("estimated_arrival")
+        if eta:
+            eta_dt = datetime.fromisoformat(eta.replace("Z", "+00:00"))
+            if eta_dt.tzinfo is None:
+                eta_dt = eta_dt.replace(tzinfo=timezone.utc)
+            mins_to_arrival = (eta_dt - datetime.now(timezone.utc)).total_seconds() / 60
+            if mins_to_arrival <= 45:
+                approaching_map[flight_num] = True
+    except Exception:
+        pass
+
+    return updates, events
 
 
-# --- Main Loop ---
+# ─── Main poll cycle ───
 
-def run_once(state, state_file):
+
+def run_once(approaching_map):
     """Single poll cycle. Returns (any_active, any_in_window, any_approaching)."""
-    flights = state.get("flights", {})
-    any_active = False
+    try:
+        flights = get_active_flights()
+    except Exception as e:
+        log.error(f"Failed to query active flights: {e}", exc_info=True)
+        return False, False, False
+
+    any_active = bool(flights)
     any_in_window = False
 
-    for flight_id, flight in flights.items():
-        if flight.get("notified_landed"):
-            continue
-
-        any_active = True
+    for flight in flights:
+        flight_num = flight["flight_number"]
 
         if not is_in_monitoring_window(flight):
-            log.debug(f"{flight_id}: outside monitoring window, skipping")
             continue
-
         any_in_window = True
 
-        # Skip mid-cruise polls to save API calls.
-        last_result = flight.get("last_result")
-        if (flight.get("last_status") == "airborne" and last_result
-                and not flight.get("_approaching")):
-            eta = (last_result.get("times") or {}).get("estimated_arrival")
-            if eta:
-                try:
+        # Skip mid-cruise polls to save API calls: if airborne with cached ETA > 45 min
+        # away and we haven't seen it approach yet, keep cruising.
+        if (flight.get("last_status") == "airborne"
+                and flight.get("last_result_json")
+                and not approaching_map.get(flight_num)):
+            try:
+                cached = json.loads(flight["last_result_json"])
+                eta = (cached.get("times") or {}).get("estimated_arrival")
+                if eta:
                     eta_dt = datetime.fromisoformat(eta.replace("Z", "+00:00"))
                     if eta_dt.tzinfo is None:
                         eta_dt = eta_dt.replace(tzinfo=timezone.utc)
                     mins_to_arrival = (eta_dt - datetime.now(timezone.utc)).total_seconds() / 60
                     if mins_to_arrival > 45:
-                        log.info(f"{flight_id}: cruising, {int(mins_to_arrival)} min to arrival — skipping poll")
+                        log.info(f"{flight_num}: cruising, {int(mins_to_arrival)} min to arrival — skipping poll")
                         continue
                     else:
-                        flight["_approaching"] = True
-                except Exception:
-                    pass
+                        approaching_map[flight_num] = True
+            except Exception:
+                pass
 
         try:
-            events = poll_flight(flight_id, flight)
+            updates, events = poll_flight(flight, approaching_map)
+            # Persist runtime updates before dispatching messages (so a crash
+            # between message and update doesn't double-fire next cycle).
+            update_flight(flight["id"], **updates)
+            # Reflect updates into the in-memory dict so message builders see fresh values.
+            merged = {**flight, **updates}
             for event_type, message in events:
                 if event_type == "not_found_alert":
-                    db = get_outbox()
-                    db.schedule(recipient=OWNER_PHONE, body=message, send_at="now",
-                               source=f"system:flight-not-found:{flight_id}",
-                               created_by="flight-monitor", priority=20)
-                    log.info(f"Not-found alert sent for {flight_id}")
+                    system_alert(merged, message, "flight-not-found")
                 else:
-                    notify(flight_id, flight, message)
+                    notify(merged, message)
         except Exception as e:
-            log.error(f"{flight_id}: poll error: {e}", exc_info=True)
+            log.error(f"{flight_num}: poll error: {e}", exc_info=True)
 
-    # Check if any flight is approaching landing (< 45 min)
-    any_approaching = any(f.get("_approaching") for f in flights.values() if not f.get("notified_landed"))
-
-    save_state(state_file, state)
+    any_approaching = any(approaching_map.get(f["flight_number"]) for f in flights)
     return any_active, any_in_window, any_approaching
 
 
 def main():
     single_run = "--once" in sys.argv
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    state_file = args[0] if args else DEFAULT_STATE_FILE
+    log.info(f"Starting flight monitor (DB-native). TRIPS_DB={TRIPS_DB}, single_run={single_run}")
 
-    log.info(f"Starting flight monitor. State: {state_file}, single_run={single_run}")
-
-    state = load_state(state_file)
-    if not state:
-        log.error("No state file found. Write a state file first, then start the monitor.")
-        sys.exit(1)
+    approaching_map = {}  # transient: flight_number → True once < 45 min to arrival
 
     if single_run:
-        any_active, _, _ = run_once(state, state_file)
+        any_active, _, _ = run_once(approaching_map)
         log.info(f"Single run complete. Active flights: {any_active}")
         sys.exit(0 if any_active else 2)
 
     while True:
-        # Re-read state file each cycle to pick up flight number changes
-        fresh_state = load_state(state_file)
-        if fresh_state:
-            for fid, fdata in fresh_state.get("flights", {}).items():
-                if fid not in state.get("flights", {}):
-                    state.setdefault("flights", {})[fid] = fdata
-                    log.info(f"New flight added: {fid}")
-            current_ids = set(fresh_state.get("flights", {}).keys())
-            for fid in list(state.get("flights", {}).keys()):
-                if fid not in current_ids:
-                    log.info(f"Flight removed: {fid}")
-                    del state["flights"][fid]
+        any_active, any_in_window, any_approaching = run_once(approaching_map)
 
-        any_active, any_in_window, any_approaching = run_once(state, state_file)
+        # Never exit: trips appear/disappear over time; the daemon stays up.
         if not any_active:
-            log.info("All flights landed. Monitor exiting.")
-            break
+            log.info("No active flights in DB — next check in idle interval.")
+            time.sleep(POLL_IDLE_SECONDS)
+            continue
 
         if any_approaching:
             sleep_time = POLL_ARRIVAL_SECONDS

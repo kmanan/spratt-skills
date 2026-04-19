@@ -27,8 +27,8 @@ from datetime import date
 
 # ─── Config ───
 
-TRIPS_DB = os.path.expanduser("~/.config/spratt/trips/trips.sqlite")
-OUTBOX_DB = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.sqlite")
+TRIPS_DB = os.path.expanduser("~/.config/spratt/db/trips.sqlite")
+OUTBOX_DB = os.path.expanduser("~/.config/spratt/db/outbox.sqlite")
 LOG_FILE = os.path.expanduser("~/Library/Logs/spratt/trip-status.log")
 
 
@@ -133,7 +133,7 @@ def generate_trip_summary(trip_id):
 
     # Use group chat from trip DB, fall back to Manan
     group_chat = trip["group_chat_guid"]
-    recipient = f"chat_guid:{group_chat}" if group_chat else MANAN
+    recipient = group_chat if group_chat else MANAN
 
     # Schedule via outbox
     subprocess.run(

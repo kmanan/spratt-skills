@@ -34,8 +34,8 @@ except ImportError:
 
 # ─── Config ───
 
-TRIPS_DB = os.path.expanduser("~/.config/spratt/trips/trips.sqlite")
-OUTBOX_DB = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.sqlite")
+TRIPS_DB = os.path.expanduser("~/.config/spratt/db/trips.sqlite")
+OUTBOX_DB = os.path.expanduser("~/.config/spratt/db/outbox.sqlite")
 TRIPS_DIR = os.path.expanduser("~/.config/spratt/memory/trips")
 LAST_SYNC_FILE = os.path.expanduser("~/.config/spratt/trips/.last-sync")
 LOG_FILE = os.path.expanduser("~/Library/Logs/spratt/trip-sync.log")
