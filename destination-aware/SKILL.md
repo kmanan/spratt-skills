@@ -23,35 +23,24 @@ python3 ~/.config/spratt/infrastructure/destination/destination-context.py \
 
 This returns JSON with:
 - `place_name` — what goplaces identified (e.g., "QFC", "Bright Horizons")
-- `categories` — grocery, medical, daycare, restaurant, or empty
-- `reminders` — relevant reminder items (Shopping list for grocery, all lists otherwise)
+- `categories` — grocery, medical, daycare, pharmacy, home, work, restaurant, or empty
+- `reminders` — structured list of dicts `{title, dueDate, listName, isCompleted}` from all reminder lists (fetched via `remindctl --json`)
 - `calendar_today` — today's calendar events (check if any match the destination location)
 
 ### Step 2: Compose a message
 
-Based on the gathered context, compose a concise text. Rules:
+The daemon handles compose automatically. It applies a **temporal gate** (drops completed and future-dated reminders), then runs **Haiku LLM filtering** per category with a tightly scoped prompt. Each category has its own instruction telling Haiku exactly what to keep and what to exclude.
 
-**Grocery store** (category = grocery):
-- Lead with the Shopping list items
-- Format: "🛒 Heading to [STORE] — [item1, item2, item3]"
-- If no Shopping items, check other lists for grocery-related reminders
+**Message formats by category:**
+- 🛒 Grocery: "Heading to [STORE] — Shopping list: [items]"
+- 🏫 Daycare: "Heading to [PLACE] — Don't forget: [items]"
+- 💊 Pharmacy: "Heading to [PLACE] — Don't forget: [items]"
+- 🏥 Medical: "Heading to [PLACE] — Don't forget: [items]"
+- 🏠 Home: "Heading to Home — Don't forget: [items]"
+- 💼 Work: "Heading to [PLACE] — Don't forget: [items]"
+- 🍽 Restaurant: "Heading to [PLACE] — Don't forget: [items]"
 
-**Daycare** (category = daycare):
-- Check reminders for anything about kids, diapers, forms, pickup
-- Check calendar for pickup/dropoff times
-- Format: "🏫 Heading to daycare — [relevant reminders]. Pickup at [time]."
-
-**Medical** (category = medical):
-- Check calendar for the appointment — include event notes/description
-- Search for any recent notes about the patient or symptoms
-- Format: "🏥 [Appointment name] — [event notes]. [Any relevant context from memory]."
-
-**Restaurant** (category = restaurant):
-- Check calendar for a dinner/lunch reservation at this location
-- Include reservation time, party size, any notes
-- Format: "🍽 [Restaurant] — Reservation at [time], party of [N]. [notes]"
-
-**No category match / no relevant context:**
+**No category match / no relevant reminders after filtering:**
 - Do NOT send a message. Stay silent.
 
 ### Step 3: Send via outbox

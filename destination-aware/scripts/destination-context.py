@@ -120,10 +120,7 @@ def get_reminders(categories):
     Returns a list of dicts: {title, dueDate (optional ISO), listName, isCompleted}.
     The daemon applies the temporal gate + category filter downstream.
     """
-    if "grocery" in categories:
-        lists_to_check = ["Shared"]
-    else:
-        lists_to_check = REMINDER_LISTS
+    lists_to_check = REMINDER_LISTS
 
     all_items = []
     for lst in lists_to_check:

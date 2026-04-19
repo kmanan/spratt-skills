@@ -207,30 +207,83 @@ def _eligible_titles(items):
     return out
 
 
-def llm_filter_grocery(items, place):
-    """Ask Haiku which items are grocery-relevant.
+CATEGORY_EMOJI = {
+    "grocery": "🛒",
+    "daycare": "🏫",
+    "pharmacy": "💊",
+    "medical": "🏥",
+    "home": "🏠",
+    "work": "💼",
+    "restaurant": "🍽",
+}
 
-    Returns the filtered subset, or None if the LLM call failed / key missing.
-    Callers should stay silent on None — better silence than dumping noise.
-    """
+CATEGORY_PROMPTS = {
+    "grocery": (
+        "Pick ONLY reminders that are grocery-shopping items — "
+        "food, drinks, household consumables bought during a routine shop. "
+        "EXCLUDE items referencing another destination, person, or delivery target "
+        '(e.g. "bring X for Sriram", "drop off at daycare"), '
+        "and EXCLUDE work/project todos, research tasks, or anything you don't "
+        "physically pick up off a grocery shelf."
+    ),
+    "daycare": (
+        "Pick ONLY reminders relevant to a daycare/preschool visit — "
+        "things to bring for the child, forms to sign, tuition, pickup/dropoff instructions, "
+        "supplies (diapers, bottles, blankets, snacks, lunch boxes), or conversations to have "
+        "with teachers/staff. EXCLUDE grocery shopping, work tasks, medical items, "
+        "and anything unrelated to the child's daycare."
+    ),
+    "pharmacy": (
+        "Pick ONLY reminders relevant to a pharmacy visit — "
+        "prescriptions to pick up or refill, OTC medications to buy, "
+        "health supplies, or anything you'd get at a pharmacy counter. "
+        "EXCLUDE general grocery items, work tasks, and anything unrelated to pharmacy/medication."
+    ),
+    "medical": (
+        "Pick ONLY reminders relevant to a doctor/medical visit — "
+        "questions to ask the doctor, symptoms to mention, test results to follow up on, "
+        "forms to bring, insurance cards, referrals, or medical supplies. "
+        "EXCLUDE grocery shopping, work tasks, and anything unrelated to the medical visit."
+    ),
+    "home": (
+        "Pick ONLY reminders relevant to arriving home — "
+        "household chores, packages to check for, things to put away, "
+        "tasks that can only be done at home. "
+        "EXCLUDE work tasks, shopping items, and anything location-independent."
+    ),
+    "work": (
+        "Pick ONLY reminders relevant to arriving at work/office — "
+        "work tasks, things to bring to the office, people to talk to at work, "
+        "meetings to prepare for. "
+        "EXCLUDE personal errands, grocery items, and home tasks."
+    ),
+    "restaurant": (
+        "Pick ONLY reminders relevant to a restaurant visit — "
+        "dietary restrictions to mention, reservations, gift cards to use, "
+        "people to meet there, or specific things to order/try. "
+        "EXCLUDE grocery items, work tasks, and anything unrelated to dining out."
+    ),
+}
+
+
+def llm_filter(items, place, category):
     if not items:
         return []
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        log.warning("ANTHROPIC_API_KEY not set; skipping grocery LLM filter")
+        log.warning("ANTHROPIC_API_KEY not set; skipping LLM filter")
         return None
+
+    category_instruction = CATEGORY_PROMPTS.get(category, (
+        f"Pick ONLY reminders that are relevant to visiting a {category} destination. "
+        f"EXCLUDE anything clearly unrelated to this type of place."
+    ))
 
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(items))
     user_content = (
-        f"Destination: {place} (a grocery store).\n"
+        f"Destination: {place} (category: {category}).\n"
         f"Reminders (open):\n{numbered}\n\n"
-        f"Pick ONLY reminders that are general grocery-shopping items to add to the cart — "
-        f"food, drinks, household consumables bought during a routine shop. "
-        f"EXCLUDE items that reference another destination, person, or delivery target "
-        f'(e.g. "bring X for Sriram", "drop off at daycare", "take to work"), '
-        f"even if the item itself is sold at the store. "
-        f"EXCLUDE work/project todos, research tasks, setup tasks, and anything that isn't "
-        f"something you physically pick up off a grocery shelf. "
+        f"{category_instruction}\n"
         f'Return ONLY JSON: {{"indices": [<1-based ints>]}}. '
         f'If none match, return {{"indices": []}}.'
     )
@@ -255,7 +308,6 @@ def llm_filter_grocery(items, place):
         text = result["content"][0]["text"].strip()
         if text.startswith("```"):
             text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```")).strip()
-        # Tolerate prose around the JSON — pull the first balanced {...}
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end > start:
@@ -265,61 +317,23 @@ def llm_filter_grocery(items, place):
         picked = [items[i - 1] for i in indices if isinstance(i, int) and 1 <= i <= len(items)]
         return picked
     except Exception as e:
-        log.warning(f"Grocery LLM filter failed: {e}")
+        log.warning(f"LLM filter failed for {category}: {e}")
         return None
-
-
-def _match_keywords(titles, keywords):
-    """Filter a list of titles to those containing any keyword (case-insensitive)."""
-    kws = [k.lower().strip() for k in keywords if k and k.strip()]
-    if not kws:
-        return []
-    return [t for t in titles if any(kw in t.lower() for kw in kws)]
-
-
-# Uniform rule: destination → matching reminder → text. No match → silence.
-BRANCHES = [
-    # (category, emoji, keyword list, include place name as keyword)
-    ("daycare",    "🏫", ["sriram", "daycare", "preschool", "bright horizons",
-                          "pickup", "drop off", "drop-off", "dropoff",
-                          "diaper", "bottle", "blanket", "nap", "formula",
-                          "snack", "lunch box", "lunchbox", "tuition",
-                          "permission slip", "sign-in", "sign in"], True),
-    ("pharmacy",   "💊", ["pharmacy", "prescription", "refill", "rx", "medication"], True),
-    ("medical",    "🏥", ["doctor", "appointment", "checkup", "consultation", "ask about"], True),
-    ("home",       "🏠", ["home"], True),
-    ("work",       "💼", ["work", "office"], True),
-    ("restaurant", "🍽", [], True),  # place name only — generic restaurant keywords are too broad
-]
 
 
 def compose_message(context):
     place = context.get("place_name", "Unknown")
     categories = context.get("categories", [])
-    # Temporal gate runs once up front — future-dated reminders never reach a branch.
     eligible = _eligible_titles(context.get("reminders"))
 
-    # Grocery gets its own LLM-filter path (more permissive than keyword match).
-    if "grocery" in categories:
-        picked = llm_filter_grocery(eligible, place)
+    for category in categories:
+        emoji = CATEGORY_EMOJI.get(category, "📍")
+        picked = llm_filter(eligible, place, category)
         if picked:
-            return f"🛒 Heading to {place}\nShopping list: {', '.join(picked)}"
-        # None (LLM failed) or [] (nothing grocery-relevant) → silent
-        return None
+            label = "Shopping list" if category == "grocery" else "Don't forget"
+            return f"{emoji} Heading to {place}\n{label}: {', '.join(picked[:5])}"
 
-    # Every other branch: keyword-match eligible titles, stay silent if empty.
-    for category, emoji, keywords, include_place in BRANCHES:
-        if category not in categories:
-            continue
-        kws = list(keywords)
-        if include_place and place and place.lower() != "unknown":
-            kws.append(place.lower())
-        matches = _match_keywords(eligible, kws)
-        if matches:
-            return f"{emoji} Heading to {place}\nDon't forget: {', '.join(matches[:5])}"
-        return None  # category matched but no reminder matched — silent
-
-    return None  # no category matched — silent
+    return None
 
 
 def send_outbox(body: str, source: str):
