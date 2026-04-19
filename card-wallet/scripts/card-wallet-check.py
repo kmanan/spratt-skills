@@ -454,9 +454,12 @@ def build_weekly_message(holder, benefits, today):
         lines.append("")
 
     if tiers["fyi"]:
-        lines.append("🟢 STILL AVAILABLE")
-        for b in tiers["fyi"]:
-            lines.append(format_benefit_line(b, today))
+        fyi_total = sum(b["amount"] for b in tiers["fyi"] if b["amount"])
+        fyi_count = len(tiers["fyi"])
+        lines.append(
+            f"🟢 {fyi_count} more benefit{'s' if fyi_count != 1 else ''} "
+            f"(${fyi_total:,.0f}) still available with 30+ days left."
+        )
         lines.append("")
 
     lines.append("A simple \"used [name]\" or \"skip [name]\" will do. I shall attend to the rest.")
