@@ -4,7 +4,7 @@
 
 A collection of infrastructure add-ons for [OpenClaw](https://github.com/openclaw/openclaw) that turn it into a household operating system. Built for a real family, running in production on a Mac Mini M4.
 
-These aren't typical OpenClaw skills (SKILL.md files that teach the LLM what to do). They're **infrastructure** — daemons, databases, pipelines, and automation that run alongside OpenClaw, handling the things an LLM shouldn't be trusted to do reliably.
+These aren't typical OpenClaw skills (SKILL.md files that teach the LLM what to do). Most are **infrastructure** — daemons, databases, pipelines, and automation that run alongside OpenClaw, handling the things an LLM shouldn't be trusted to do reliably. Some (Apple Reminders, Tool Routing) are pure skill definitions that teach the LLM correct tool selection and usage patterns.
 
 ## The Core Idea: LLM Plans, Code Delivers
 
@@ -146,9 +146,9 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 
 ### 10. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
 
-When you set a destination in your Tesla, this daemon detects it via Home Assistant's WebSocket `subscribe_trigger` and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know. Every category (grocery, daycare, pharmacy, medical, home, work, restaurant) runs through Haiku with a category-specific prompt so unrelated todos don't get dumped into the message.
+When you set a destination in your Tesla, this daemon detects it via Home Assistant's WebSocket `subscribe_trigger` and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know. Every category (grocery, daycare, pharmacy, medical, home, work, restaurant) runs through Haiku with a category-specific prompt so unrelated todos don't get dumped into the message. Now includes full instructions for **creating destination-aware reminders** — recurring (weekly day-specific), one-time, and permanent — with rules for how the temporal gate and LLM filter interact so reminders fire on the right day and for the right destination.
 
-**Why it exists:** "Bring diapers to daycare" sitting in a reminder list doesn't help if you only see it at 7am and forget by 5pm pickup. The reminder should surface when you're actually heading there.
+**Why it exists:** "Bring diapers to daycare" sitting in a reminder list doesn't help if you only see it at 7am and forget by 5pm pickup. The reminder should surface when you're actually heading there. And when the LLM creates those reminders, it needs to understand the daemon's gating mechanism — a non-recurring reminder for a weekly task goes overdue and fires on every matching trip regardless of day.
 
 | | |
 |---|---|
@@ -186,19 +186,33 @@ Weekly meal planning that reads from your recipe database, checks pantry invento
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes + first-use household onboarding conversation |
 
-### 13. [Apple Reminders — Recurring](./apple-reminders/) — Recurring Reminder Support
+### 13. [Apple Reminders](./apple-reminders/) — Full Reminders Management + Recurring Support
 
-A compiled Swift binary that creates proper recurring Apple Reminders via EventKit. The `remindctl` CLI doesn't support recurrence, so without this, the LLM creates individual copies for each occurrence — fragile and cluttered.
+Full Apple Reminders management via the `remindctl` CLI (view, add, edit, complete, delete, list routing) plus a compiled Swift binary for recurring reminders via EventKit. The `remindctl` CLI doesn't support recurrence natively, so the EventKit binary fills that gap.
 
-**Why it exists:** "Remind me every Monday to bring diapers to daycare" should create one recurring reminder, not 12 individual ones.
+**Why it exists:** "Remind me every Monday to bring diapers to daycare" should create **one recurring reminder**, not 12 individual copies. And the LLM needs clear routing rules for which reminder list to use (per-person lists, Shared, Shopping) and how to create destination-aware reminders that interact correctly with the destination daemon's temporal gate.
 
 | | |
 |---|---|
-| **What you get** | create-recurring-reminder (Swift binary + source) |
-| **Dependencies** | macOS, Swift compiler (Xcode Command Line Tools) |
-| **Schedule** | N/A — invoked on demand when user requests a recurring reminder. |
+| **What you get** | SKILL.md (full remindctl usage + list routing + destination-aware cross-reference), create-recurring-reminder (Swift binary + source) |
+| **Dependencies** | macOS, Swift compiler (Xcode Command Line Tools), [remindctl](https://github.com/steipete/remindctl) |
+| **Schedule** | N/A — invoked on demand when user requests a reminder. |
 | **macOS-specific** | Yes (EventKit is Apple-only) |
 | **Setup time** | ~2 minutes (compile + grant permissions) |
+
+### 14. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
+
+A routing table that maps user intents to the correct tool or skill. Covers messaging (live `message` vs scheduled `outbox`), productivity tools, web/browser, trips, email attachments, the "what are our plans?" multi-source check, forwarded-email semantics, and the cron-vs-outbox hard boundary. Also includes TaskFlow guidance for multi-step interactive workflows (trip planning, Instacart cart building, Resy bookings) that span multiple turns and need durable state tracking.
+
+**Why it exists:** With 13+ skills and multiple messaging pathways, the LLM needs a single reference for "which tool do I use for this?" Without it, common mistakes recur — using crons for message delivery instead of the outbox, sending scheduled messages via `message` instead of the outbox, or missing data sources when asked about plans.
+
+| | |
+|---|---|
+| **What you get** | SKILL.md (routing table, messaging rules, TaskFlow patterns, cron boundary) |
+| **Dependencies** | None (pure routing instructions) |
+| **Schedule** | N/A — read on demand when the LLM needs to pick a tool. |
+| **macOS-specific** | No |
+| **Setup time** | ~1 minute (copy to skills directory) |
 
 ---
 

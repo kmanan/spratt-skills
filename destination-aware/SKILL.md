@@ -6,7 +6,7 @@ version: 1.0.0
 
 # Destination-Aware Reminders
 
-When Manan sets a destination in the Tesla, this skill surfaces relevant context before he arrives.
+When the owner sets a destination in the Tesla, this skill surfaces relevant context before they arrive.
 
 ## Trigger
 
@@ -49,12 +49,61 @@ Only if there is relevant context to share:
 
 ```bash
 python3 ~/.config/spratt/infrastructure/outbox/outbox.py schedule \
-  --to "Manan" \
+  --to "OWNER" \
   --body "MESSAGE" \
   --at now \
   --source "destination-aware" \
   --created-by "destination-aware"
 ```
+
+## Creating destination-aware reminders
+
+When someone asks for a reminder tied to a destination ("remind me X when I go to Y", "every Monday at daycare remind me to bring Z"), you must create the reminder so the daemon surfaces it correctly.
+
+### How the daemon gates reminders
+
+The daemon runs two filters on every destination event:
+1. **Temporal gate** (`_eligible_titles`): only reminders due today/overdue or undated pass. Future-dated reminders are dropped.
+2. **LLM filter**: remaining reminders are matched to the destination category (grocery, daycare, home, etc.) by title.
+
+**The dueDate controls WHICH DAYS the reminder fires. The title controls WHICH DESTINATIONS it matches.**
+
+### Recurring day-specific ("every Monday at daycare", "every Friday coming home")
+
+Use `create-recurring-reminder`:
+```bash
+~/.config/spratt/skills/apple-reminders/create-recurring-reminder "<title>" <day-of-week> <HH:MM> <list> [notes]
+```
+
+Rules:
+- **Title must be matchable to the destination category.** Include destination context:
+  - Daycare drop-off: "Take X to Bright Horizons" / "Bring X to daycare"
+  - Home from daycare: "Take X home from daycare" / "Bring X back from daycare"
+  - Grocery: "Get X at Costco" / "Buy X"
+- **Day and time must match the actual trip pattern.** Monday 07:30 for morning drop-off, Friday 16:00 for evening pickup. Ask the user if unclear.
+- **List:** Use per-person list names for individual reminders, `Shared` for shared household items.
+- **One recurring reminder per day+destination combination.** Never create individual copies per week.
+- **The user completes the reminder each week** on their phone. Apple auto-advances the dueDate to the next occurrence. If they don't complete it, it stays overdue and fires on subsequent matching trips (intended — it nags).
+
+### One-time destination ("next time I'm at QFC get ginger", "at the doctor Thursday ask about the rash")
+
+Use `remindctl add`:
+```bash
+remindctl add --title "<title>" --list <list> [--due <date>]
+```
+
+- **Specific future date** (e.g., doctor on Thursday): use `--due <date>`. Won't fire until that day.
+- **"Next time I go to X"** with no date: omit `--due`. Undated reminders pass the temporal gate every day, firing on the next matching trip. Complete after.
+
+### Permanent destination ("always remind me to check the cubby at daycare")
+
+Use `remindctl add` with no due date. Fires on every matching destination trip until completed.
+
+### What NOT to do
+
+- **NEVER create a non-recurring reminder for a weekly task.** It goes overdue after one week and fires on every matching trip regardless of day — this is the #1 cause of wrong-day destination spam.
+- **NEVER put destination reminders on a list the daemon doesn't check.** The daemon checks the lists configured in `get_reminders()` (default: per-person lists + `Shared`).
+- **NEVER create duplicate reminders with the same purpose.** One reminder per day+destination. Duplicates across lists cause double messages.
 
 ## Important rules
 
