@@ -216,7 +216,7 @@ Follow this sequence. If Instacart's UI has changed (e.g. button text differs, O
 Use `gog` CLI. This is the **only** method. Never open Gmail, Yahoo, Outlook, or any email provider in the browser.
 
 ```bash
-gog gmail messages search "from:instacart subject:verification newer_than:10m" \
+gog gmail messages search "from:instacart subject:verification after:$(date -v-10M +%s)" \
   --account "<INSTACART_CODE_EMAIL>" --json --max 1
 ```
 

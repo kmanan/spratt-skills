@@ -4,7 +4,7 @@ Example cron prompt for an email scanning agent that triages recent emails and i
 
 **Key design decisions:**
 - Scan by **time window** (last 8 hours), NOT by unread status. Users open emails to check details — that shouldn't cause the scanner to skip them.
-- Use the `query --after` command for Outlook and `newer_than:` for Gmail.
+- Use the `query --after` command for Outlook and `after:` with epoch seconds for Gmail. **Do NOT use `newer_than:` — it silently fails when combined with other operators like `is:unread`.**
 - The 8-hour window provides overlap with a 3x/day scan schedule (e.g., 7:30am, 1:30pm, 6pm).
 - Order deduplication is handled by `order-ingest.py` (skips if `order_id + source` already exists), so re-scanning the same email is harmless.
 - Instacart orders are ingested with empty items — the `instacart-orders` skill fills them in later via browser scraping.
@@ -23,7 +23,7 @@ Outlook:
 outlook-mail.sh --account ACCOUNT query --after "$CUTOFF" --folder Inbox --count 30
 
 Gmail:
-gog gmail search -a ACCOUNT "newer_than:8h"
+gog gmail search -a ACCOUNT "after:$(date -v-8H +%s)"
 
 Classify each email by subject and sender ONLY:
 - ACTIONABLE: order confirmations, flight/hotel bookings, delivery notifications
