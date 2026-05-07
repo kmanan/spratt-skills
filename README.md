@@ -200,7 +200,21 @@ Full Apple Reminders management via the `remindctl` CLI (view, add, edit, comple
 | **macOS-specific** | Yes (EventKit is Apple-only) |
 | **Setup time** | ~2 minutes (compile + grant permissions) |
 
-### 14. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
+### 14. [Email PDF Attachment](./email-pdf-attachment/) — Native PDF Extraction from Email
+
+Skill instructions for finding Outlook/Gmail emails with PDF attachments, downloading them to an OpenClaw-allowed media path, and reading them through OpenClaw's native PDF capability. The scheduled Spratt email scan uses the same principle: PDF attachments are processed through OpenClaw's bundled `document-extract` PDF extractor before LLM structured extraction.
+
+**Why it exists:** Email attachments are a common source of travel bookings, invoices, medical reports, and other structured data. The LLM should not ask the user to paste PDF contents or invent a local parser path. It should use the native PDF tool/extractor and then write deterministic outputs through the right system.
+
+| | |
+|---|---|
+| **What you get** | SKILL.md with Outlook/Gmail attachment lookup, download allowlist, native `pdf` tool usage, scheduled-script `document-extract` path, and downstream action mapping |
+| **Dependencies** | OpenClaw `pdf` skill/tool, OpenClaw bundled `document-extract` plugin, Outlook Graph scripts or `gog` Gmail CLI |
+| **Schedule** | N/A — invoked by interactive workflows and mirrored by scheduled email scan implementation |
+| **macOS-specific** | No for extraction; downstream actions may use macOS Reminders/Calendar depending on the workflow |
+| **Setup time** | ~2 minutes if email auth is already configured |
+
+### 15. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
 
 A routing table that maps user intents to the correct tool or skill. Covers messaging (live `message` vs scheduled `outbox`), productivity tools, web/browser, trips, email attachments, the "what are our plans?" multi-source check, forwarded-email semantics, and the cron-vs-outbox hard boundary. Also includes TaskFlow guidance for multi-step interactive workflows (trip planning, Instacart cart building, Resy bookings) that span multiple turns and need durable state tracking.
 
