@@ -47,6 +47,23 @@ List Routing
   - Shared household items (groceries, house tasks) -> `--list Shopping` (grocery) or `--list Shared` (other)
 - If unclear who it's for, ask.
 
+Reminder vs FYI: The Narrow-Scope Rule
+- **A reminder is for items with BOTH (a) an explicit deadline or specific date AND (b) a real consequence if missed.** Everything else is an FYI text, not a reminder.
+- Qualifies as a reminder:
+  - "Submit form by Friday" (deadline + consequence)
+  - "RSVP by 5/12"
+  - "Renew passport" (deadline implied by expiry)
+  - "Confirm scheduled appointment by date X"
+  - User explicitly says "remind me to ..."
+- Does NOT qualify — send a one-line FYI text instead:
+  - Family member started/shared a cart, doc, or list ("wife started an Instacart cart")
+  - Vendor invites or save-the-dates without a deadline
+  - Account/order/shipping status updates
+  - Points, rewards, marketing soft-CTAs ("offer ends soon")
+  - General awareness items the user already knows about from the source
+- Why this matters: a reminder list cluttered with non-actionable items becomes noise. The user stops trusting it, and briefings/digests over-report. When in doubt, send the FYI text.
+- This rule is enforced upstream in the email-scan pipeline (decide -> extract -> run): items routed as `notify` send a one-line outbox text and mark the email read; only items with `route: reminder` AND a `due_date` create a reminder. User-curated forwards are the one passthrough exception.
+
 Edit Reminders
 - Edit title/due: `remindctl edit 1 --title "New title" --due 2026-01-04`
 
