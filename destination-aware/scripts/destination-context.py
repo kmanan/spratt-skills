@@ -23,7 +23,7 @@ RESTAURANT_TYPES = {"restaurant", "cafe", "bar", "meal_delivery", "meal_takeaway
 REMINDER_LISTS = ["Manan", "Harshita", "Shared"]
 
 
-def run(cmd, timeout=10):
+def run(cmd, timeout=5):
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
@@ -133,6 +133,7 @@ def get_reminders(categories):
             continue
         for it in items:
             all_items.append({
+                "id": it.get("id"),
                 "title": it.get("title", ""),
                 "dueDate": it.get("dueDate"),  # ISO 8601 or None
                 "listName": it.get("listName", lst),

@@ -1,5 +1,7 @@
 {
-  "_comment": "Known Tesla destinations → category. Matched case-insensitive, longest key wins. 'categories' is priority-ordered; the first matching compose branch fires.",
+  "_comment": "Known Tesla destinations → category. Matched case-insensitive, longest key wins. 'categories' on each destination is priority-ordered; the first matching compose branch fires.",
+  "_categories_comment": "Canonical category enum. Single source of truth for the destination side AND the reminder #tag vocabulary. Adding a new category requires only this list + a destination entry that uses it.",
+  "categories": ["home", "work", "grocery", "pharmacy", "daycare", "medical", "restaurant"],
   "destinations": {
     "home":            {"categories": ["home"],                "name": "Home"},
     "work":            {"categories": ["work"],                "name": "Work"},

@@ -24,10 +24,12 @@ launchd KeepAlive restarts the process on any unhandled exit.
 import json
 import logging
 import os
+import re
+import sqlite3
 import subprocess
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from threading import Event, Lock
 
 import websocket
@@ -49,6 +51,9 @@ HEARTBEAT_FILE = os.path.expanduser(
 )
 KNOWN_DESTINATIONS_FILE = os.path.expanduser(
     "~/.config/spratt/infrastructure/destination/known-destinations.json"
+)
+REMINDER_FIRES_DB = os.path.expanduser(
+    "~/.config/spratt/db/reminder_fires.sqlite"
 )
 
 PING_INTERVAL = 30       # send app-layer ping every N seconds
@@ -149,6 +154,30 @@ def lookup_known(destination):
     return {"name": entry.get("name", best_key.title()), "categories": entry.get("categories", [])}
 
 
+# --- Tag parsing & category vocabulary (v2) ---
+
+TAG_RE = re.compile(r"#(\w+)")
+
+
+def load_allowed_categories():
+    """Canonical category enum from known-destinations.json. Empty on error
+    so the caller falls through to the LLM filter (pre-v2 behavior)."""
+    try:
+        with open(KNOWN_DESTINATIONS_FILE) as f:
+            return set(json.load(f).get("categories", []))
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        log.warning(f"known-destinations.json categories unavailable: {e}")
+        return set()
+
+
+def parse_tags(title):
+    return {m.lower() for m in TAG_RE.findall(title or "")}
+
+
+def strip_tags(title):
+    return TAG_RE.sub("", title or "").strip()
+
+
 def gather_context(destination, lat=None, lng=None, known=None):
     try:
         cmd = ["/usr/bin/python3", CONTEXT_SCRIPT, "--destination", destination]
@@ -178,32 +207,100 @@ def _parse_iso(s):
     return datetime.fromisoformat(s)
 
 
-def _eligible_titles(items):
-    """Temporal gate: return titles of reminders that are open AND either undated
-    or due today / overdue in local time. Future-dated reminders are dropped.
+# --- Cadence gate & fire tracking (v2) ---
 
-    Context (Issue #3): the blanket reminder with dueDate=next Monday should NOT
-    fire on a Wednesday daycare trip. Apple Reminders auto-advances the next
-    recurring instance's dueDate when you complete one, so filtering on the
-    single upcoming dueDate handles weekly/daily/monthly recurrence without
-    needing EventKit recurrence rules (which remindctl doesn't expose anyway).
+def _fires_db():
+    """Connection with schema ensured. Cheap idempotent."""
+    os.makedirs(os.path.dirname(REMINDER_FIRES_DB), exist_ok=True)
+    conn = sqlite3.connect(REMINDER_FIRES_DB)
+    conn.execute("""CREATE TABLE IF NOT EXISTS reminder_fires (
+        reminder_id TEXT NOT NULL,
+        fired_at TEXT NOT NULL,
+        destination TEXT NOT NULL,
+        category TEXT NOT NULL,
+        PRIMARY KEY (reminder_id, fired_at)
+    )""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_reminder_fires_recent
+        ON reminder_fires (reminder_id, fired_at DESC)""")
+    return conn
+
+
+def _load_recent_fires():
+    """Map reminder_id -> most recent fire datetime, last 30d only."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        with _fires_db() as conn:
+            rows = conn.execute(
+                "SELECT reminder_id, MAX(fired_at) FROM reminder_fires "
+                "WHERE fired_at >= ? GROUP BY reminder_id",
+                (cutoff,),
+            ).fetchall()
+        return {rid: _parse_iso(ts) for rid, ts in rows}
+    except sqlite3.Error as e:
+        log.warning(f"reminder_fires bulk lookup failed: {e}")
+        return {}
+
+
+def record_fire(reminder_id, destination, category):
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        with _fires_db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO reminder_fires VALUES (?, ?, ?, ?)",
+                (reminder_id, now_iso, destination, category),
+            )
+    except sqlite3.Error as e:
+        log.warning(f"reminder_fires insert failed: {e}")
+
+
+def _days_until_due(due_iso):
+    if not due_iso:
+        return None
+    try:
+        due = _parse_iso(due_iso)
+        return (due - datetime.now(due.tzinfo)).days
+    except (ValueError, TypeError):
+        return None
+
+
+def _tier_cooldown(days):
+    """Seconds of cooldown required since last fire. 0 = no rate limit."""
+    if days is None or days <= 7:
+        return 0
+    if days <= 30:
+        return 86400
+    return 7 * 86400
+
+
+def _eligible_titles(items):
+    """Reminders passing the lead-time cadence gate.
+
+    Tier behavior:
+      None / overdue / due in <=7d  → every trip (no cooldown)
+      <=30d                          → once per day per reminder
+      >30d                           → once per week per reminder
+    Recurrence still works because Apple advances dueDate on completion.
+
+    Returns list of {id, title, days, prefix}.
     """
-    now_local = datetime.now().astimezone()
-    end_of_today = now_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+    recent_fires = _load_recent_fires()
+    now_utc = datetime.now(timezone.utc)
     out = []
     for r in items or []:
         if not isinstance(r, dict) or r.get("isCompleted"):
             continue
-        due = r.get("dueDate")
-        if due:
-            try:
-                if _parse_iso(due) > end_of_today:
-                    continue
-            except (ValueError, TypeError):
-                pass  # unparseable → treat as undated, pass through
+        rid = r.get("id")
         title = (r.get("title") or "").strip()
-        if title:
-            out.append(title)
+        if not rid or not title:
+            continue
+        days = _days_until_due(r.get("dueDate"))
+        cooldown = _tier_cooldown(days)
+        if cooldown > 0:
+            last = recent_fires.get(rid)
+            if last is not None and (now_utc - last).total_seconds() < cooldown:
+                continue
+        prefix = f"due in {days}d" if days is not None and days >= 1 else None
+        out.append({"id": rid, "title": title, "days": days, "prefix": prefix})
     return out
 
 
@@ -321,17 +418,62 @@ def llm_filter(items, place, category):
         return None
 
 
+def _fmt_item(item):
+    return f"{item['display']} ({item['prefix']})" if item.get("prefix") else item["display"]
+
+
 def compose_message(context):
+    # Tagged: deterministic set intersection. Untagged: LLM filter (legacy path).
+    # Tagged-but-non-matching is DROPPED. Returns {body, fires} or None.
     place = context.get("place_name", "Unknown")
-    categories = context.get("categories", [])
+    destination_categories = context.get("categories", [])
     eligible = _eligible_titles(context.get("reminders"))
 
-    for category in categories:
-        emoji = CATEGORY_EMOJI.get(category, "📍")
-        picked = llm_filter(eligible, place, category)
-        if picked:
+    allowed = load_allowed_categories()
+    dest_set = set(destination_categories) & allowed if allowed else set()
+
+    tagged_by_cat = {}
+    untagged = []
+    for r in eligible:
+        tags = parse_tags(r["title"]) & allowed if allowed else set()
+        if not tags:
+            untagged.append(r)
+            continue
+        intersect = tags & dest_set
+        if not intersect:
+            continue
+        # Multi-category reminders pin to the destination's highest-priority match.
+        for category in destination_categories:
+            if category in intersect:
+                tagged_by_cat.setdefault(category, []).append({
+                    "id": r["id"],
+                    "display": strip_tags(r["title"]),
+                    "prefix": r["prefix"],
+                })
+                break
+
+    for category in destination_categories:
+        items = tagged_by_cat.get(category)
+        if items:
+            emoji = CATEGORY_EMOJI.get(category, "📍")
             label = "Shopping list" if category == "grocery" else "Don't forget"
-            return f"{emoji} Heading to {place}\n{label}: {', '.join(picked[:5])}"
+            displays = [_fmt_item(i) for i in items[:5]]
+            body = f"{emoji} Heading to {place} [{category}]\n{label}: {', '.join(displays)}"
+            fires = [{"id": i["id"], "category": category} for i in items[:5]]
+            return {"body": body, "fires": fires}
+
+    for category in destination_categories:
+        titles_only = [r["title"] for r in untagged]
+        picked_titles = llm_filter(titles_only, place, category)
+        if picked_titles:
+            picked_records = [r for r in untagged if r["title"] in picked_titles][:5]
+            emoji = CATEGORY_EMOJI.get(category, "📍")
+            label = "Shopping list" if category == "grocery" else "Don't forget"
+            displays = [_fmt_item({"display": strip_tags(r["title"]), "prefix": r["prefix"]})
+                        for r in picked_records]
+            body = f"{emoji} Heading to {place} [{category}?]\n{label}: {', '.join(displays)}"
+            fires = [{"id": r["id"], "category": category} for r in picked_records]
+            return {"body": body, "fires": fires}
 
     return None
 
@@ -370,12 +512,14 @@ def handle_destination(destination, ha_url, ha_token):
     categories = context.get("categories", [])
     place_name = context.get("place_name", "Unknown")
     log.info(f"Resolved: {place_name} ({', '.join(categories) or 'uncategorized'})")
-    message = compose_message(context)
-    if not message:
+    result = compose_message(context)
+    if not result:
         log.info(f"No relevant context for {place_name}, staying silent")
         return
-    log.info(f"Sending notification for {place_name}")
-    send_outbox(message, "destination-aware")
+    log.info(f"Sending notification for {place_name} ({len(result['fires'])} reminder(s))")
+    send_outbox(result["body"], "destination-aware")
+    for fire in result["fires"]:
+        record_fire(fire["id"], place_name, fire["category"])
 
 
 def load_last_handled():
