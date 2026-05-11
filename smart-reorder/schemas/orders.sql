@@ -14,3 +14,8 @@ CREATE INDEX idx_orders_date ON orders(order_date);
 CREATE INDEX idx_orders_source ON orders(source);
 CREATE INDEX idx_orders_tracking ON orders(tracking_number) WHERE tracking_number IS NOT NULL;
 CREATE TABLE item_aliases (raw_name TEXT PRIMARY KEY, canonical_name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+CREATE TABLE reorder_notifications (
+  canonical_key TEXT PRIMARY KEY,
+  notified_at TEXT NOT NULL,
+  last_purchased_at_notify TEXT NOT NULL
+);

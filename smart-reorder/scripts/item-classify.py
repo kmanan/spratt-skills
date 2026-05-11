@@ -19,10 +19,16 @@ import os
 import sqlite3
 import sys
 
-ORDERS_DB = os.path.expanduser("~/.config/spratt/orders/orders.sqlite")
+ORDERS_DB = os.path.expanduser("~/.config/spratt/db/orders.sqlite")
 
 
 def get_db():
+    if not os.path.exists(ORDERS_DB):
+        sys.stderr.write(
+            f"\nFATAL: orders database not found at:\n    {ORDERS_DB}\n\n"
+            f"Refusing to auto-create (prevents silent data loss if the path is wrong).\n\n"
+        )
+        sys.exit(1)
     conn = sqlite3.connect(ORDERS_DB)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")

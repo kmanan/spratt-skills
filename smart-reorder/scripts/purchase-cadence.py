@@ -19,7 +19,19 @@ from collections import defaultdict
 from datetime import datetime, date
 from statistics import median
 
-ORDERS_DB = os.path.expanduser("~/.config/spratt/orders/orders.sqlite")
+ORDERS_DB = os.path.expanduser("~/.config/spratt/db/orders.sqlite")
+
+
+def require_db_file(path, name):
+    """Fail loudly if a SQLite DB file doesn't exist where expected.
+    Prevents silent split-brain from path resolution bugs.
+    """
+    if not os.path.exists(path):
+        sys.stderr.write(
+            f"\nFATAL: {name} database not found at:\n    {path}\n\n"
+            f"Refusing to auto-create (prevents silent data loss if the path is wrong).\n\n"
+        )
+        sys.exit(1)
 
 
 def normalize_name(name):
@@ -39,25 +51,35 @@ def normalize_name(name):
 
 def load_aliases(db_path):
     """Load the item_aliases table into a dict: raw_name -> canonical_name."""
+    require_db_file(db_path, "orders")
     conn = sqlite3.connect(db_path)
     rows = conn.execute("SELECT raw_name, canonical_name FROM item_aliases").fetchall()
     conn.close()
     return {r[0]: r[1] for r in rows}
 
 
-def get_item_history(db_path, store=None):
-    """Extract all instacart items with their order dates from the DB."""
+def get_item_history(db_path, store=None, sources=None):
+    """Extract items with their order dates from the DB.
+
+    sources: list of order source values to include. Defaults to ['instacart']
+    to preserve original single-source behavior for existing callers.
+    """
+    require_db_file(db_path, "orders")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
-    query = """
+    if not sources:
+        sources = ["instacart"]
+
+    placeholders = ",".join("?" for _ in sources)
+    query = f"""
         SELECT order_date, items, store
         FROM orders
-        WHERE source = 'instacart'
+        WHERE source IN ({placeholders})
           AND items != '[]'
           AND json_array_length(items) > 0
     """
-    params = []
+    params = list(sources)
     if store:
         query += " AND store = ?"
         params.append(store)
@@ -110,9 +132,9 @@ def compute_cadence(dates):
     return median(gaps)
 
 
-def analyze(db_path, store=None, min_purchases=2):
+def analyze(db_path, store=None, min_purchases=2, sources=None):
     """Run cadence analysis and return list of items with status."""
-    history, name_map = get_item_history(db_path, store)
+    history, name_map = get_item_history(db_path, store, sources=sources)
     today = date.today()
     results = []
 
@@ -137,6 +159,7 @@ def analyze(db_path, store=None, min_purchases=2):
 
         results.append({
             "item": name_map[norm_name],
+            "canonical_key": norm_name,
             "purchases": len(unique_dates),
             "cadence_days": round(cadence, 1),
             "days_since": days_since,
@@ -154,12 +177,15 @@ def analyze(db_path, store=None, min_purchases=2):
 def main():
     parser = argparse.ArgumentParser(description="Analyze purchase cadence from orders.sqlite")
     parser.add_argument("--store", default=None, help="Filter by store (e.g. qfc, costco)")
+    parser.add_argument("--sources", default="instacart",
+                        help="Comma-separated order sources to include (default: instacart)")
     parser.add_argument("--min-purchases", type=int, default=2, help="Minimum purchases to qualify (default: 2)")
     parser.add_argument("--format", choices=["json", "text"], default="text", help="Output format")
     parser.add_argument("--due-only", action="store_true", help="Only show due and soon items")
     args = parser.parse_args()
 
-    results = analyze(ORDERS_DB, store=args.store, min_purchases=args.min_purchases)
+    sources = [s.strip() for s in args.sources.split(",") if s.strip()]
+    results = analyze(ORDERS_DB, store=args.store, sources=sources, min_purchases=args.min_purchases)
 
     if args.due_only:
         results = [r for r in results if r["status"] in ("due", "soon")]

@@ -90,16 +90,16 @@ Instacart confirmation emails don't contain itemized order details — they just
 
 Analyzes your grocery purchase history to predict when you'll need to reorder each item. Calculates median days between purchases per product, flags items that are due or coming up soon. An LLM (Flash) classifies receipt item names into canonical products — so "QFC Vitamin D Whole Milk Half Gallon" and "QFC Vitamin D Whole Milk" are recognized as the same thing, while "Organic Valley Whole Milk" stays separate (different brand).
 
-Feeds into the [Instacart Skill](./instacart-skill/) (below) for cart building.
+Feeds into the [Instacart Skill](./instacart-skill/) (below) for cart building, and into `reorder-nudge.py` which sends a deterministic "🛒 Time to buy X" iMessage twice a week. The nudge is intentionally notification-only — no browser, no cart-building, no LLM at run time — because unattended Instacart automation has too many human-in-the-loop blockers (2FA, payment confirmation, item disambiguation). A `reorder_notifications` table tracks last-notified state per canonical item so the same thing doesn't get announced over and over until you actually buy it.
 
-**Why it exists:** "We're out of milk again" shouldn't require remembering. The system knows you buy milk every 7 days and your last order was 8 days ago.
+**Why it exists:** "We're out of milk again" shouldn't require remembering. The system knows you buy milk every 7 days and your last order was 8 days ago — and on Wednesday morning it pings your phone with the list.
 
 | | |
 |---|---|
-| **What you get** | purchase-cadence.py (cadence analysis CLI), item-classify.py (alias management CLI), SQLite schema (item_aliases table) |
-| **Dependencies** | Python 3, SQLite, Email-to-Orders + Instacart Orders (above) for data. Flash (via nightly cron) for item classification. |
-| **Schedule** | Item classification runs as part of the nightly Instacart scraper cron. Cadence analysis is on-demand (called by the Instacart ordering skill or interactively). |
-| **macOS-specific** | No |
+| **What you get** | purchase-cadence.py (cadence analysis CLI, supports `--sources` for multi-source aggregation), item-classify.py (alias management CLI), reorder-nudge.py (iMessages "time to buy X" via the outbox, with per-item dedupe across runs), SQLite schema (item_aliases + reorder_notifications tables) |
+| **Dependencies** | Python 3, SQLite, Email-to-Orders + Instacart Orders (above) for data. Flash (via nightly cron) for item classification. Outbox (above) for reorder-nudge delivery. |
+| **Schedule** | Item classification runs as part of the nightly Instacart scraper cron. Cadence analysis is on-demand. Reorder-nudge fires twice weekly (Wed + Sat 8am local) via launchctl — no LLM at notification time, just SQL → text → outbox. |
+| **macOS-specific** | The reorder-nudge launchctl plist is macOS-specific; the underlying script is portable to any cron. |
 | **Setup time** | ~5 minutes (after Instacart Orders is set up) |
 
 ### 7. [Instacart Skill](./instacart-skill/) — Browser-Based Grocery Cart Building
