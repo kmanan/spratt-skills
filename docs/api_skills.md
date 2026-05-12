@@ -480,6 +480,38 @@ Comprehensive audit lives in conversation history. Short version of the rejects 
 - **Harshita's iMessage handle for discovery nudges:** `+13129330988` (Wife).
 - **Food-butler reply state:** Inline-everything in the nudge body for v1. The reply matcher is the strict substring check (`"place the order" in reply.lower()`) — see the global hard constraint at the top. Revisit TaskFlow `setWaiting`/`resume` only if reply correctness suffers when replies arrive 30+ min later in a fresh session.
 
+## Phase 0 — install + doctor pass (executed 2026-05-11)
+
+**Toolchain prerequisite resolved:** Go 1.26.3 installed to `~/go-sdk/go` (user-writable, no sudo/Homebrew — `spratt` user is non-admin). PATH update added to `~/.config/spratt/infrastructure/env.sh` so all future shell sessions and launchd jobs sourcing env.sh see `go`, `weather-goat-pp-cli`, `flight-goat-pp-cli`, `wanderlust-goat-pp-cli`. Binaries land in `~/go/bin/`.
+
+**Catalog access:** `mvanhorn/printing-press-library` is actually **public** (despite the README's "private" wording). `gh` auth as `kmanan` works for fetches without env-var token setup; the installer accepts `GH_TOKEN=$(gh auth token)` inline if a future install needs it.
+
+**Install pattern (record for next phases):**
+```bash
+source ~/.config/spratt/infrastructure/env.sh
+GH_TOKEN=$(gh auth token) npx -y @mvanhorn/printing-press install <cli>
+```
+
+**Installed in Phase 0 (don't-need-Manan-present subset):**
+
+| CLI | Binary name | Doctor verdict | Phase impact |
+|---|---|---|---|
+| `weather-goat` | `weather-goat-pp-cli` | ✅ Config + auth + API all OK on `forecast` and `alerts`. ❌ `air-quality` and `geocoding` 404 due to a base-URL bug in the CLI — both endpoints live on subdomain hosts (`air-quality-api.open-meteo.com`, `geocoding-api.open-meteo.com`) but the CLI hits `api.open-meteo.com/v1/<endpoint>`. Verified with `--dry-run` + raw curl. | **Phase 1 partial unlock.** `forecast` works (the primary wttr replacement). NWS `alerts` works. AQI needs a workaround until upstream fixes the air-quality subcommand: either call `air-quality-api.open-meteo.com` directly from a small Python helper in `gather-briefing-data.py` (keyless, same data), or file `weather-goat-pp-cli feedback` upstream and wait. We'll wrap the direct call — small, deterministic, keeps Phase 1 shippable. |
+| `flight-goat` | `flight-goat-pp-cli` | ⚠️ Auth wanted env `FLIGHT_GOAT_API_KEY_AUTH`, not `FLIGHTAWARE_API_KEY`. Aliased in env.sh — both names point to the same FlightAware key. Cash side (Google Flights via native Go) is **keyless** and works end-to-end: smoke-tested `flights SEA LAX 2026-06-15 --stops non_stop` → 23 nonstop results, full leg + price data. | **Phase 2 cash anchor ready.** `flight-cash.py` helper can wrap `flight-goat-pp-cli flights <origin> <destination> <date> --agent` directly. Phase 2b (award search) still blocked on `SEATS_AERO_API_KEY`. |
+| `wanderlust-goat` | `wanderlust-goat-pp-cli` | ✅ All green. Detects `GOOGLE_PLACES_API_KEY` ✅ + `ANTHROPIC_API_KEY` ✅. **Does NOT use `GOOGLE_API_KEY`** — Maps Geocoding is via Nominatim/OSM, not Google. The `GOOGLE_API_KEY` in shell env is not consumed by this CLI. Smoke test: `goat "47.674,-122.121" --criteria "third-wave coffee" --minutes 10 --top 3` returned 3 ranked Redmond picks with `walking_minutes`, `score` subscores, `why` one-liner, and `google_maps_uri` deeplink — exactly the discovery-butler payload shape. | **Phase 4 unblocked.** Use `goat` (deterministic) for the cron path; reserve `near --llm` for ad-hoc richer Q&A. Field names for the discovery-butler script: `name`, `address`, `lat`, `lng`, `walking_minutes`, `score.total`, `why`, `google_maps_uri`, `business_status` (filter to `OPERATIONAL`). |
+
+**Notable CLI surface observations (record for skill authoring):**
+
+- All three CLIs accept `--agent` as a global flag that turns on `--json --compact --no-input --no-color --yes` together. Use this everywhere — single contract.
+- All three have `doctor`, `feedback`, `sync`, `analytics`, `profile`, `workflow` subcommands. The `workflow` surface is a candidate for composing multi-step calls later.
+- `weather-goat forecast` flag shape: `--latitude` and `--longitude` are **floats, required**. Place-name resolution must happen upstream (HA already supplies lat/lon, so this is fine for Phase 1).
+- `flight-goat flights` flag shape: `<origin> <destination> <date>` are **positionals**, not flags. Date is `YYYY-MM-DD`.
+- `wanderlust-goat goat` accepts the anchor as either a free-text address or `"<lat>,<lng>"` positional. No `--latitude`/`--longitude` flags.
+
+**Upstream feedback ticket to file (when adopting Phase 1):**
+
+`weather-goat-pp-cli`: `air-quality` and `geocoding` subcommands construct URLs against `api.open-meteo.com/v1/<endpoint>` but Open-Meteo serves those on dedicated subdomains. Suggested fix: per-endpoint base URL in config (or hardcoded subdomains in the route table). Submit via `weather-goat-pp-cli feedback`.
+
 ## Phase 0 — env-var requirements (pre-build doctor pass)
 
 Audited what Manan already has vs. what each CLI needs. Run `<cli> doctor` (or equivalent) once the CLI is installed; do not stub keys.
