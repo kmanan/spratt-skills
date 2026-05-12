@@ -29,9 +29,9 @@ Enhance specific Spratt subsystems with CLIs from the Printing Press Library. Ev
 | 4 | `wanderlust-goat` | **NEW** `discovery-butler` skill — Thu/Fri weekend nudges + day 1-3 trip nudges | ADD |
 | 5a | `dominos` | **NEW** `food-butler` skill (multi-tenant, `vendors/dominos.md`) — Friday "shitty carbs" check-in | ADD |
 | 5b | (Jimmy John's) | `food-butler/vendors/jimmy-johns.md` — weekday-lunch tenant | ADD (planned) |
-| 6 | `instacart` | (none — see Findings) | **BLOCKED** |
+| 6 | `instacart` | **NEW** `instacart-api` skill — replaces browser cart-build (search + add). Order placement stays on Manan's phone (one tap). Ingestion via scraper unchanged. | REPLACE (cart-build only) |
 
-**Untouched by this plan:** `trip-manager`, `flight-monitor`, `recipe-instacart`, `orders.sqlite` (read-only by new skills), outbox, briefings pipeline beyond the weather replacement, the four briefing/digest cron jobs (model & schedule unchanged), the two `card-wallet` cron jobs, and per the revised Phase 6 also: `instacart-skill`, `instacart-orders`, `Instacart Order Scraper` cron, and the email-scan Instacart branch (its three pre-existing flag bugs are tracked separately).
+**Untouched by this plan:** `trip-manager`, `flight-monitor`, `recipe-instacart` (the IG/FB reel → recipe pipeline itself — but Phase 6 wires it to the new `instacart-api` for the shop-this step), `orders.sqlite` schema, outbox, briefings pipeline beyond the weather replacement, the four briefing/digest cron jobs, the two `card-wallet` cron jobs, the **`Instacart Order Scraper` cron** (stays enabled — ingestion stays on the scraper until the CLI exposes past-order fetch), `instacart-orders` skill (drives the scraper, stays active), and the email-scan Instacart branch's three pre-existing flag bugs (tracked as an independent fix).
 
 ---
 
@@ -43,7 +43,7 @@ Reviewed all 6 CLIs (READMEs in `mvanhorn/printing-press-library`) and every Spr
 
 | CLI | Plan assumed | Actually true |
 |---|---|---|
-| `instacart` | Fetches order items by `order_id`; places orders | **Cart-build only.** No `order get` (past orders documented as "known gap"). No `order place`. Auth via Chrome cookie jar — doesn't handle 2FA itself. |
+| `instacart` | Fetches order items by `order_id`; places orders; replaces scraper | **Cart-build only.** No `order get` (past orders documented as "known gap"). No `order place`. But auth via Chrome cookie jar is actually nicer (no `gog` 2FA dance). The CLI's strength is the bot-painful 80% (search + cart build); order placement is a 5-second human action. Past-order ingestion stays on the scraper. |
 | `table-reservation-goat` | OpenTable + Tock + SevenRooms | OpenTable + Tock + Resy. **No SevenRooms.** Also: `book` is gated behind `TRG_ALLOW_BOOK=1` (defaults dry-run). |
 | `wanderlust-goat` | Returns structured `neighborhood` + `editorial_blurb` | Returns ranked picks with source citations + score breakdowns. Exact JSON fields not documented in README — verify against `--help` before hardcoding field names. |
 | `seats-aero` | Covers ANA / Aeroplan / Virgin / Avianca | Wraps the Seats.aero Partner API as-is. Partner coverage depends on subscription tier, not the CLI. Verify our tier before relying on a specific program. |
@@ -70,7 +70,7 @@ Reviewed all 6 CLIs (READMEs in `mvanhorn/printing-press-library`) and every Spr
 
 ### Plan impacts
 
-- **Phase 6 (instacart) is BLOCKED.** The catalog CLI cannot fetch past order items and cannot place orders — both core assumptions of the original plan. Scope revised below.
+- **Phase 6 (instacart) is REVISED, not blocked.** The CLI cannot place orders or fetch past-order items — but those weren't the painful parts. The CLI replaces the bot-painful 80% (search + cart-build) and leaves order placement on Manan's phone (one tap). Past-order ingestion stays on the scraper. The real unlock is downstream: `recipe-instacart`, `smart-reorder`, and `meal-planner` all gain programmatic cart-build via `instacart-api`. Scope revised below.
 - **Phase 3 (resy) loses SevenRooms.** Still valuable for the OpenTable + Tock coverage gap.
 - **Phase 5 (food-butler) compose model is Flash, not Haiku.** Per CLAUDE.md, Haiku is reserved for briefings/digests. A Friday nudge is orchestration-shaped → Flash with Haiku fallback.
 - **Email-scan Instacart branch bugs are independent of Phase 6** and should be fixed regardless.
@@ -79,56 +79,98 @@ Reviewed all 6 CLIs (READMEs in `mvanhorn/printing-press-library`) and every Spr
 
 ## Selected CLIs (6)
 
-### 1. `instacart` — BLOCKED (CLI lacks required capabilities)
+### 1. `instacart` — REPLACE browser cart-building; keep one-tap submit on the phone
 
-**Status:** Originally scoped to REPLACE the browser-based ordering + nightly scraper. After verifying the `library/commerce/instacart` README, neither core assumption holds:
+**Reframe:** The original plan asked the CLI to do both halves of the browser workflow (build the cart **and** place the order) plus replace the ingestion scraper. The CLI doesn't do all three. But the half it does do — search + cart-build — is exactly the half that's been bot-painful (`openclaw browser` + DOM scraping + `gog` 2FA dance). Order placement (one tap in the Instacart app) doesn't need a bot, and ingestion of past-order items is fine where it is (the scraper works).
 
-- **No past-order fetch.** The README documents this explicitly as a known gap: "Past orders are in the mobile app surface and a separate query we haven't captured." No `order get --order-id` command exists. Without this, email-scan cannot upgrade to inline item fetching.
-- **No order placement.** The CLI manages carts (`cart new/add/remove/show`) and replays `UpdateCartItemsMutation`. It has no `orders place` or `checkout` command. Cart building only — the human still has to check out in browser or app.
-- **No 2FA handling.** Auth works by reading cookies from an already-authenticated Chrome session via `kooky`. The CLI doesn't initiate login or handle 2FA codes. The browser-path `gog` email-watcher pattern doesn't transfer.
+So the bot/human boundary moves to the right place:
 
-The browser path's two skills + scraper cron together do end-to-end ingestion (receipt → full items) and end-to-end ordering (search → cart → checkout). The CLI can only partially overlap with one half of the cart-build step. Replacing the browser path with this CLI would lose order placement and lose past-order ingestion entirely.
+- **Bot does (via CLI):** product search across retailers, fuzzy-matched cart construction, multi-retailer carts, cart review summary in iMessage
+- **You do (on your phone, 5 seconds):** open the Instacart app, tap "Place Order"
 
-**What's actually current Instacart state (constellation):**
+That's a strict ergonomics win — no browser launch, no DOM flakiness, no `openclaw browser` runtime, no agent-driven 2FA. The auth model also gets cleaner: you log in to Instacart in Chrome once; the CLI reads that session via `kooky` for weeks. No `gog` watcher needed. When cookies expire, `auth status` flips and Spratt alerts via outbox.
 
-| # | Component | Status |
+**What the CLI actually exposes:**
+
+| Command | Use |
+|---|---|
+| `search <query>` | Canonical product search (replaces DOM search) |
+| `add <retailer> <query>` | Search + add to cart in one step |
+| `cart show / remove` | View, modify |
+| `carts` | List all carts (across retailers) |
+| `auth login / status / logout` | Chrome-cookie-based session |
+| `capture` | Re-seed GraphQL hashes if Instacart rotates its web bundle |
+
+**What the CLI doesn't expose — and why each is fine:**
+
+| Gap | Why it's not a blocker |
+|---|---|
+| No `orders place` / checkout | One-tap action on Manan's phone. Bot doesn't need this. Cleaner accountability: the human signs off on every order. |
+| No `orders get <id>` past-order fetch | Past-order ingestion stays on the existing scraper cron. The scraper works; no reason to retire it without a clean replacement. If the catalog adds the mobile GraphQL query (or we contribute it via `instacart capture`), revisit. |
+| No 2FA handling | The CLI doesn't need it — Chrome handles 2FA at login, CLI rides the resulting cookie session for weeks. Better than today's `gog` email watcher. |
+
+**Current Instacart state (10 components, not 11 — `smart-reorder` and `email-to-orders` skill dirs don't exist on disk):**
+
+| # | Component | Change |
 |---|---|---|
-| 1 | `skills/instacart-skill` (browser ordering + `gog` 2FA) | Active. Untouched by revised plan. |
-| 2 | `skills/instacart-orders` (nightly scraper) | Active. Untouched by revised plan. |
-| 3 | `skills/orders` (read-only Q&A) | Active. Untouched. |
-| 4 | `infra/orders/order-ingest.py` | Active. Has 3 pre-existing flag bugs in the email-scan caller (see below). |
-| 5 | `infra/orders/item-classify.py` | Active. Triggered nightly by the scraper cron — losing this caller would orphan classification. |
-| 6 | `infra/orders/purchase-cadence.py` | Active. |
-| 7 | `infra/orders/reorder-nudge.py` | Active (launchd, Wed + Sat 8am). |
-| 8 | Cron `Instacart Order Scraper` (21:00 daily) | `enabled: true`. Unchanged. |
-| 9 | Cron `Instacart Backfill (one-time)` | `enabled: false`. Unchanged. |
-| 10 | Email-scan Instacart branch | **Broken today.** `run-email-actions.py upsert_order()` passes `--order-date`, `--items-json`, `--status` — none of these are valid flags on `order-ingest.py`. The shell-insert silently fails. The scraper has been the only path producing populated items. |
+| 1 | `skills/instacart-skill` (browser cart-build + `gog` 2FA) | **Deprecated** — replaced by new `instacart-api` skill |
+| 2 | `skills/instacart-orders` (nightly scraper) | **Unchanged** — ingestion stays on the scraper |
+| 3 | `skills/orders` (read-only Q&A) | Unchanged |
+| 4 | `infra/orders/order-ingest.py` | Unchanged. (3 pre-existing flag bugs in its email-scan caller — see below.) |
+| 5 | `infra/orders/item-classify.py` | Unchanged. Scraper still triggers it nightly. |
+| 6 | `infra/orders/purchase-cadence.py` | Unchanged |
+| 7 | `infra/orders/reorder-nudge.py` | Unchanged. **Becomes actionable** once `instacart-api` can build carts in response to "yes" replies. |
+| 8 | Cron `Instacart Order Scraper` (21:00 daily) | **Stays `enabled: true`** — supports ingestion |
+| 9 | Cron `Instacart Backfill (one-time)` | Stays disabled |
+| 10 | Email-scan Instacart branch | Unchanged behavior (still inserts shell). 3 pre-existing flag bugs to fix in a separate small change. |
 
-The two skills `smart-reorder` and `email-to-orders` previously listed in this plan **do not exist on disk** — drop from the constellation count (so it's 10, not 11; and `instacart-orders` is the scraper, not a third browser skill).
+**The killer downstream unlocks (the real reason to do this):**
 
-**Decoupled fix — independent of any Phase 6 work:**
+Today these flows hit the same browser-cart-build wall:
 
-The `run-email-actions.py upsert_order()` flag bugs are independent of the CLI capability gap and need fixing regardless. Correct flags:
+| Flow | Today | With `instacart-api` |
+|---|---|---|
+| `recipe-instacart` reel → recipe → ingredients | Manual or via `instacart-skill` (browser) | Recipe ingredients → CLI search + add → cart ready in app → one tap |
+| `smart-reorder` "eggs are due to reorder" nudge | Informational only | "yes" reply → CLI builds cart → "ready in your app, tap to submit" |
+| `meal-planner` weekly shop | Manual | Plan → CLI builds cart → one tap |
+| Destination-aware bridge ("pick up X at QFC" reminder) | Reminder only | "or add to your Costco cart for tomorrow" → CLI builds → one tap |
+
+These are the unlocks Phase 6 is actually about. The "replace fragile browser ordering" framing was selling the wrong story.
+
+**Phased rollout (revised):**
+
+| Sub-phase | Action | Reversibility |
+|---|---|---|
+| 6a | Install `instacart` CLI. `auth login` via Chrome cookies. Verify search + `carts` + `cart show` work read-only against an existing cart. | n/a — read-only |
+| 6b | Build new `instacart-api` skill: search + cart-build wrapper. Manual test: build a 5-item cart, review, you place the order on your phone. Confirm cart contents match. | Don't enable until 6c |
+| 6c | Wire `recipe-instacart`'s "shop this" step to call `instacart-api` (killer integration). Verify on 1–2 recipes. | Revert by reverting `recipe-instacart`'s shop step |
+| 6d | Deprecate `instacart-skill` (browser cart-build) — rename `SKILL.md` → `SKILL.md.disabled`. `instacart-api` becomes sole cart-build path. | Rename back |
+| 6e | Wire `smart-reorder` + `meal-planner` reply-handlers to call `instacart-api` on "yes." Optional — depends on whether smart-reorder needs an action verb in v1. | Revert reply-handler edits |
+
+**Auth health check:**
+
+Add `instacart_auth_healthy` to `spratt-health`:
+```bash
+instacart auth status --json  # 0 = ok, non-zero = relog needed
+```
+Surface a one-line "Instacart session expired — please log in to Instacart in Chrome" via outbox when it flips, so you know before a cart-build attempt fails.
+
+**Decoupled fix (independent of any Phase 6 work):**
+
+`run-email-actions.py upsert_order()` has three live flag bugs against `order-ingest.py`:
 
 | Current (wrong) | Correct |
 |---|---|
 | `--order-date` | `--date` |
 | `--items-json <file>` | `--items-file <file>` |
-| `--status <s>` | (remove — not an insert flag; status applies to `update-tracking` subcommand) |
+| `--status <s>` | (remove — status applies to `update-tracking`, not insert) |
 
-Also: `run-email-actions.py` currently sets `order_date = datetime.now()` rather than parsing the email's order date. This compounds the bug — `purchase-cadence.py` keys cadence off `order_date`, so corrupted dates degrade reorder nudges.
+Also: `order_date = datetime.now()` instead of parsing the email body. This corrupts `purchase-cadence.py` cadence math. Fix in a separate small change; don't couple to Phase 6.
 
-**Recommended action:** fix the three flag bugs + the order-date extraction in a separate small change. Don't bundle with any Phase 6 revisit.
+**Subsystems touched:** New `instacart-api` skill. `instacart-skill/SKILL.md` renamed to `.disabled` at 6d. `recipe-instacart`'s shop-this step (at 6c). Optionally `smart-reorder` + `meal-planner` reply handlers (at 6e).
+**Subsystems NOT touched:** `instacart-orders`, scraper cron, `order-ingest.py`, `item-classify.py`, `purchase-cadence.py`, `reorder-nudge.py`, `orders.sqlite` schema, email-scan Instacart branch (independent fix elsewhere).
 
-**When could Phase 6 unblock?**
-
-Two upstream gates would have to change:
-1. `instacart` CLI gains an `orders get --order-id` command (or equivalent), so email-scan can fetch full items inline. The README author called this out as a known gap, so it may land.
-2. `instacart` CLI gains an `orders place` / `checkout` command, so interactive ordering can leave the browser. Less likely in the short term.
-
-If only (1) lands, partial scope is viable: cutover the **ingestion** path (replace scraper cron) but leave interactive ordering on the browser. Revisit then.
-
-**Revised verdict:** Phase 6 BLOCKED. No code changes to the Instacart constellation in this plan beyond the unrelated email-scan flag bug fix.
+**Revisit trigger:** if the catalog adds a `orders get <id>` query (mobile GraphQL captured), the **ingestion** half of Phase 6 also unblocks — revisit retiring the scraper then.
 
 ---
 
@@ -405,7 +447,7 @@ Inline everything in the outbox message — order, price, card. Reply context ar
 | 4 | `wanderlust-goat` `discovery-butler` skill: daily 2pm cron, mostly silent; Thu/Fri at home + day 1–3 of trip | Standalone new cron — disable to revert |
 | 5a | `food-butler` skill scaffold + Dominos tenant + Friday 4pm cron | Disable cron + rename `vendors/dominos.md` |
 | 5b | Jimmy John's tenant added under same skill once 5a stable (4+ Friday cycles) | Disable JJ cron + rename `vendors/jimmy-johns.md` |
-| 6 | **BLOCKED.** `instacart` CLI lacks order-fetch and order-place commands. No work scoped. | n/a |
+| 6 | **REVISED.** New `instacart-api` skill replaces browser cart-build (search + add). One-tap order placement stays on Manan's phone. Scraper-driven ingestion unchanged. Downstream: `recipe-instacart`, `smart-reorder`, `meal-planner` get programmatic cart-build. | Rename `instacart-skill/SKILL.md` back, revert recipe-instacart shop step |
 | Independent fix | `run-email-actions.py upsert_order()` flag bugs (`--order-date`, `--items-json`, `--status`) + `order_date` extraction. Unblocks reliable scraper-shell handoff. | Single-file change, easy to revert |
 
 Run order: Phase 1 first (lowest blast radius, single-day delivery). Phase 2 in parallel (additive, doesn't touch any existing code path). Phase 3 next (introduces revert-ready file renames + first new launchd plist for cancellation watch). Phase 4 once Phase 3's plist pattern is validated. Phase 5a after Phase 4 — Friday nudge reply-and-act pattern benefits from the discovery-butler outbox cadence experience. Phase 5b after 4+ stable Dominos Fridays. The independent email-scan fix can go anytime — it's a defect, not a feature.
@@ -437,4 +479,4 @@ Comprehensive audit lives in conversation history. Short version of the rejects 
 - **`seats-aero` partner coverage** — depends on our Seats.aero subscription tier, not the CLI. Verify ANA / Aeroplan / Virgin / Avianca are exposed by our key before promising those redemptions in card-wallet's SKILL.md.
 - **Food-butler reply state** — inline-everything in the nudge body vs TaskFlow `setWaiting`/`resume`. Inline is simpler; TaskFlow is more robust for replies arriving 30+ minutes later in a fresh session. Default to inline for v1; revisit if reply correctness suffers.
 - **Email-scan Instacart flag bugs** — independent of Phase 6, but worth a same-day fix. The shell-insert step has been silently failing; only the scraper has been keeping items populated. While at it, also fix `order_date = datetime.now()` to extract the real order date from the email body.
-- **Phase 6 revisit trigger** — if `instacart` CLI gains an `orders get --order-id` command, the **ingestion** half of Phase 6 unblocks (replace the scraper cron). Order placement likely remains browser-only for longer. Watch the catalog repo.
+- **Phase 6 ingestion revisit trigger** — if `instacart` CLI gains an `orders get --order-id` command (or we contribute one via `instacart capture`), the ingestion half also unblocks: email-scan can fetch full items inline at receipt time, and the scraper cron can retire. Order placement likely stays one-tap on Manan's phone regardless — that's where it belongs.
