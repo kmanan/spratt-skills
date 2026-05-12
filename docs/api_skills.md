@@ -10,6 +10,7 @@ Enhance specific Spratt subsystems with CLIs from the Printing Press Library. Ev
 
 ## Hard constraints
 
+- **No order is ever placed without Manan explicitly saying the exact phrase "place the order".** This is a global rule across every order-placing path in this plan: food-butler (Dominos, future JJ), instacart-api, smart-reorder reply handlers, meal-planner, recipe-instacart "shop this," destination-aware bridges. "yes," "do it," "send it," "go ahead," "ok," and any LLM-paraphrased equivalent do NOT trigger placement. The verb is fixed — exact-string match on `"place the order"` (case-insensitive, leading/trailing whitespace allowed). Nudges present and stage; only the explicit phrase commits.
 - **DO NOT TOUCH `trip-manager` or `flight-monitor`.** The travel concierge works perfectly. Award/cash redemption logic lives in **`card-wallet`**, not in trip planning. No CLI in this plan integrates into `trips.sqlite` or `flight-monitor`.
 - **DO NOT TOUCH `recipe-instacart` / IG-FB-TikTok → recipe pipeline.** It uses a logged-in browser profile by design. No catalog CLI replaces it.
 - **No fallback — revert where needed.** One path active, the other dormant on disk. Never run both in parallel.
@@ -145,7 +146,7 @@ These are the unlocks Phase 6 is actually about. The "replace fragile browser or
 | 6b | Build new `instacart-api` skill: search + cart-build wrapper. Manual test: build a 5-item cart, review, you place the order on your phone. Confirm cart contents match. | Don't enable until 6c |
 | 6c | Wire `recipe-instacart`'s "shop this" step to call `instacart-api` (killer integration). Verify on 1–2 recipes. | Revert by reverting `recipe-instacart`'s shop step |
 | 6d | Deprecate `instacart-skill` (browser cart-build) — rename `SKILL.md` → `SKILL.md.disabled`. `instacart-api` becomes sole cart-build path. | Rename back |
-| 6e | Wire `smart-reorder` + `meal-planner` reply-handlers to call `instacart-api` on "yes." Optional — depends on whether smart-reorder needs an action verb in v1. | Revert reply-handler edits |
+| 6e | Wire `smart-reorder` + `meal-planner` reply-handlers to call `instacart-api` on the **exact phrase "place the order"** (per global hard constraint). Optional — depends on whether smart-reorder needs an action verb in v1. Even when wired, the CLI builds the cart only; Manan still taps "Place Order" in the Instacart app — so "place the order" here means "build the cart for me to tap." | Revert reply-handler edits |
 
 **Auth health check:**
 
@@ -376,7 +377,7 @@ Each vendor module specifies:
 - **Gates** — conditions that suppress firing (trip in progress, prior reservation, anti-nag cooldown)
 - **Order template** — the "usual" the user would re-up (pulled from `orders.sqlite` history or a static seed)
 - **Voice** — the one-liner the compose step should produce
-- **Reply verbs** — what user replies count as "go" ("yes", "send it", "do it")
+- **Reply verb (universal):** the exact phrase `"place the order"` (case-insensitive, surrounding whitespace stripped) is the **only** trigger that commits an order. No paraphrases. No vendor-specific verbs. See hard constraint at the top of this doc.
 
 **Per-vendor crons:**
 
@@ -407,19 +408,21 @@ There is **no unified "is tonight blocked?" helper** in the codebase today — t
 Pizza tonight, sir? Domino's BOGO is live.
 Your usual: 2 large pepperoni + cheesy bread, $28.40 with the deal.
 Use CSR (3x dining). ETA 35 min from order.
-Reply "yes" to send it.
+Reply "place the order" to commit. Any other reply, or no reply, and I stand down.
 ```
 
 **Sample output (Jimmy John's, weekday lunch — planned shape):**
 ```
 Lunch, sir? JJ #9 Italian Night Club, $9.50 with chips.
 Delivery 12 min to home. CSR 3x dining.
-Reply "yes" to send it.
+Reply "place the order" to commit. Any other reply, or no reply, and I stand down.
 ```
 
 **Reply handling (shared):**
 
 Inline everything in the outbox message — order, price, card. Reply context arrives carrying enough state that Spratt doesn't need perfect memory recall to act. The reply handler is in the skill itself, not per-vendor, so adding a vendor doesn't touch reply parsing.
+
+The matcher is a strict substring check: `"place the order" in reply.lower()`. That accepts "place the order", "place the order!", "yes, place the order", "go ahead, place the order please" — but rejects "yes", "do it", "send it", "place it", "place order", "ok send", or any LLM-paraphrased equivalent. The phrase must appear verbatim. Intentional friction, by Manan's directive.
 
 **Implementation phasing inside Phase 5:**
 - **5a** — Build `food-butler` skill scaffold + Dominos tenant + Dominos cron. Ship.
@@ -471,12 +474,41 @@ Comprehensive audit lives in conversation history. Short version of the rejects 
 
 ---
 
+## Resolved decisions (2026-05-11)
+
+- **Discovery-butler cron model:** `openai-codex/gpt-5.5` via `openclaw infer model run --gateway --model openai-codex/gpt-5.5`. Same pattern as email-scan — uses Manan's Codex subscription, no per-token Anthropic/Gemini cost. Fallback to Flash. (Phase 4.) Phase 5 food-butler compose step uses the same gateway invocation, same model.
+- **Harshita's iMessage handle for discovery nudges:** `+13129330988` (Wife).
+- **Food-butler reply state:** Inline-everything in the nudge body for v1. The reply matcher is the strict substring check (`"place the order" in reply.lower()`) — see the global hard constraint at the top. Revisit TaskFlow `setWaiting`/`resume` only if reply correctness suffers when replies arrive 30+ min later in a fresh session.
+
+## Phase 0 — env-var requirements (pre-build doctor pass)
+
+Audited what Manan already has vs. what each CLI needs. Run `<cli> doctor` (or equivalent) once the CLI is installed; do not stub keys.
+
+| CLI | Required env / auth | Already have | Action |
+|---|---|---|---|
+| `weather-goat` | None — Open-Meteo + NWS are keyless. Optional `WEATHER_GOAT_USER_AGENT` for polite NWS use. | n/a | Set a polite UA string in env.sh; no key needed. |
+| `flight-goat` | `FLIGHTAWARE_API_KEY` for the live-flight side; **Google Flights cash side** uses a public scrape — verify with `--help` whether a key is required (some forks require `GOOGLE_API_KEY` or none). | `FLIGHTAWARE_API_KEY` ✅ (in `~/.config/spratt/infrastructure/env.sh`), `GOOGLE_API_KEY` ✅ (shell), `GOOGLE_PLACES_API_KEY` ✅ (shell) | Card-wallet only uses the cash side; FA key is incidental. Confirm at Phase 2. |
+| `seats-aero` | `SEATS_AERO_API_KEY` (Partner API subscription). | **NOT set** — needs Manan to provision. | **BLOCKER for Phase 2 award-search half.** Cash-anchor half (flight-goat) can ship without it. |
+| `table-reservation-goat` | `TRG_ALLOW_BOOK=1` (env gate; defaults dry-run). OpenTable + Tock via Chrome-cookie auth (`auth login --chrome` — no key). Resy stays on the existing direct token in `skills/resy/`. | n/a — auth is cookie-based | Set `TRG_ALLOW_BOOK=1` in the cancellation-watch plist's `EnvironmentVariables`, NOT in shell env (keep dry-run as the global default). |
+| `wanderlust-goat` | Likely **Google Maps Geocoding / Places** for location resolution + an editorial source. Confirm with `--help` / `doctor` before wiring. | `GOOGLE_API_KEY` ✅ (Maps), `GOOGLE_PLACES_API_KEY` ✅ | Map `GOOGLE_API_KEY` → Maps Geocoding/Places usage in wanderlust-goat. If it wants a distinct `WANDERLUST_GOAT_GOOGLE_KEY`, alias to the existing key in env.sh. |
+| `dominos` | No API key. Bearer token harvested from Chrome (`auth refresh`), ~1h TTL. | n/a | Document the refresh cadence in food-butler SKILL.md. Add `dominos auth status` to `spratt-health`. |
+| `instacart` | No API key. Chrome cookie jar via `kooky` (`auth login`). | n/a | Add `instacart auth status` to `spratt-health` (see Phase 6 auth-health). |
+
+**LLM model env (compose steps, not CLI-specific):**
+
+| Use | Routing | Key |
+|---|---|---|
+| Discovery-butler one-line compose (Phase 4) | `openclaw infer model run --gateway --model openai-codex/gpt-5.5` | OpenClaw gateway (no per-job key) |
+| Food-butler one-line compose (Phase 5) | same | same |
+| Card-wallet redemption reasoning (Phase 2) | In-skill, runs in Manan's live session | `ANTHROPIC_API_KEY` ✅ (already used) |
+
+**The one Phase-0 blocker:** `SEATS_AERO_API_KEY`. Manan needs to provision a Seats.aero Partner API key before Phase 2's award-search helper can be built. The cash-anchor helper (Phase 2a, `flight-cash.py`) can ship independently — it only needs the existing keys.
+
 ## Open items
 
-- **Discovery-butler cron model** — Flash (default) vs Haiku. The compose step is a single butler-voice line. Flash with Haiku fallback is the conservative pick (Haiku is reserved for briefings/digests per CLAUDE.md). Confirm before wiring.
-- **Harshita's iMessage handle for discovery nudges** — `contacts_lookup` has two numbers: `+12034792084` (Harshita Iyer) and `+13129330988` (Wife). Confirm which.
 - **`wanderlust-goat` output schema** — README documents ranked picks with source citations + score breakdowns, but exact JSON field names aren't shown. Verify with `--help` / a manual run before hardcoding field names in `discovery-butler/nudge.py`.
-- **`seats-aero` partner coverage** — depends on our Seats.aero subscription tier, not the CLI. Verify ANA / Aeroplan / Virgin / Avianca are exposed by our key before promising those redemptions in card-wallet's SKILL.md.
-- **Food-butler reply state** — inline-everything in the nudge body vs TaskFlow `setWaiting`/`resume`. Inline is simpler; TaskFlow is more robust for replies arriving 30+ minutes later in a fresh session. Default to inline for v1; revisit if reply correctness suffers.
+- **`seats-aero` partner coverage** — depends on Manan's Seats.aero subscription tier, not the CLI. Once the key is provisioned, verify ANA / Aeroplan / Virgin / Avianca are exposed before promising those redemptions in card-wallet's SKILL.md.
+- **`flight-goat` Google Flights side key requirement** — README is ambiguous on whether a key is required for the cash side. Run `flight-goat doctor` at Phase 0 and document.
+- **`wanderlust-goat` Maps key shape** — confirm whether it reads `GOOGLE_API_KEY` directly or a CLI-specific name (`WANDERLUST_GOAT_GOOGLE_KEY`, etc.) at Phase 0.
 - **Email-scan Instacart flag bugs** — independent of Phase 6, but worth a same-day fix. The shell-insert step has been silently failing; only the scraper has been keeping items populated. While at it, also fix `order_date = datetime.now()` to extract the real order date from the email body.
-- **Phase 6 ingestion revisit trigger** — if `instacart` CLI gains an `orders get --order-id` command (or we contribute one via `instacart capture`), the ingestion half also unblocks: email-scan can fetch full items inline at receipt time, and the scraper cron can retire. Order placement likely stays one-tap on Manan's phone regardless — that's where it belongs.
+- **Phase 6 ingestion revisit trigger** — if `instacart` CLI gains an `orders get --order-id` command (or we contribute one via `instacart capture`), the ingestion half also unblocks: email-scan can fetch full items inline at receipt time, and the scraper cron can retire. Order placement stays one-tap on Manan's phone regardless — that's where it belongs per the global hard constraint.
