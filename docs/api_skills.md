@@ -16,6 +16,22 @@ Enhance specific Spratt subsystems with CLIs from the Printing Press Library. Ev
 
 ---
 
+## At-a-glance: integrations → skills
+
+| Phase | CLI(s) | Skill / subsystem (new or changed) | Verdict |
+|---|---|---|---|
+| 1 | `weather-goat` | `briefings` (morning + evening, both people) — adds AQI, alerts, 24h precip outlook | AUGMENT |
+| 2 | `seats-aero`, `flight-goat` | `card-wallet` (no trip-manager touch) — award sweet-spot finder + cash-vs-points sanity check | AUGMENT |
+| 3 | `table-reservation-goat` | `resy` skill — adds OpenTable + Tock + SevenRooms beside the existing Resy API | AUGMENT |
+| 4 | `wanderlust-goat` | **NEW** `discovery-butler` skill — Thu/Fri weekend nudges + day 1-3 trip nudges | ADD |
+| 5a | `dominos` | **NEW** `food-butler` skill (multi-tenant, `vendors/dominos.md`) — Friday "shitty carbs" check-in | ADD |
+| 5b | (Jimmy John's) | `food-butler/vendors/jimmy-johns.md` — weekday-lunch tenant | ADD (planned) |
+| 6 | `instacart` | **NEW** `instacart-api` skill replaces `instacart-skill` + `instacart-orders` (both deprecated, revert-ready) | REPLACE |
+
+**Untouched by this plan:** `trip-manager`, `flight-monitor`, `recipe-instacart`, `order-ingest.py`, `item-classify.py`, `purchase-cadence.py`, `reorder-nudge.py`, `smart-reorder`, `orders`, `email-to-orders`, outbox, briefings pipeline scripts.
+
+---
+
 ## Selected CLIs (6)
 
 ### 1. `instacart` — REPLACE fragile browser ordering (revert-ready, no fallback)
