@@ -125,7 +125,21 @@ The bot builds the cart. Manan places the order. The CLI has no `place`/`checkou
 | **macOS-specific** | launchd plist is macOS-specific; underlying script is portable. |
 | **Setup time** | ~10 minutes (`instacart-pp-cli auth login` once, then drop the plist) |
 
-### 8. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
+### 8. [Discovery Butler](./discovery-butler/) — Casual Coffee / Quick-Bite Nudges
+
+A friend who knows the area and occasionally texts you a fun spot. Daily 2:00pm launchd cron, mostly silent. Fires Thursday (Friday fallback) for two principals at home, and day 1 (or 2/3 fallback) of any active trip into the trip's iMessage chat. One per person per ISO week at home; one per trip total on trips.
+
+**Why it exists:** `places.sqlite` tracks places you've already saved, but there was no surface for "what's new and worth trying." Browsing-when-hungry produces decision fatigue picks; a once-a-week nudge with a single walk-in suggestion solves a real ergonomic gap without becoming another notification to mute. Most cron firings produce nothing — that silence is the point.
+
+| | |
+|---|---|
+| **What you get** | `scripts/nudge.py` (~280 lines — discovery, dedup vs places.sqlite, compose with LLM gateway, outbox-routed delivery, fires-DB dedup), SKILL.md, launchd plist example |
+| **Dependencies** | [`wanderlust-goat-pp-cli`](https://github.com/mvanhorn/printing-press-library) (needs `GOOGLE_PLACES_API_KEY`), OpenClaw with gateway access to `openai-codex/gpt-5.5` (or any compose model — falls back to Flash, then deterministic template), Spratt's outbox CLI, Home Assistant `person.*` + Places integration (optional — falls back to a hardcoded home anchor), `trips.sqlite` with `trips` + `travelers` tables (optional — at-home flow works without it) |
+| **Schedule** | launchd `com.spratt.discovery-butler` daily 2:00pm. Mostly silent. Smoke-test path: `python3 nudge.py --smoke` (compose + print, no outbox/DB writes). |
+| **macOS-specific** | launchd plist is macOS-specific; underlying script is portable. |
+| **Setup time** | ~10 minutes once `wanderlust-goat-pp-cli` is installed and `GOOGLE_PLACES_API_KEY` is in env. |
+
+### 9. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
 
 Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft Graph API. Multi-account OAuth2 with auto-refreshing tokens. Calendar events support descriptions, attendees, and multi-calendar targeting — create a family appointment on the "For Family" calendar with attendees and notes in one command.
 
@@ -139,7 +153,7 @@ Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft 
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
-### 9. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
+### 10. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
 
 A SQLite database for places you want to remember — restaurants, bars, activities, attractions. Share an Instagram post, Google Maps link, Yelp page, or just say "remember that Thai place on Queen West" and it gets saved with category, cuisine, location, tags, and notes. Query by vibe ("date night spots"), location, cuisine, or who saved it. Track visits and ratings.
 
@@ -153,7 +167,7 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes |
 
-### 10. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
+### 11. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
 
 When you set a destination in your Tesla, this daemon detects it via Home Assistant's WebSocket `subscribe_trigger` and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know. Every category (grocery, daycare, pharmacy, medical, home, work, restaurant) runs through Haiku with a category-specific prompt so unrelated todos don't get dumped into the message. Now includes full instructions for **creating destination-aware reminders** — recurring (weekly day-specific), one-time, and permanent — with rules for how the temporal gate and LLM filter interact so reminders fire on the right day and for the right destination.
 
@@ -167,7 +181,7 @@ When you set a destination in your Tesla, this daemon detects it via Home Assist
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~10 minutes (after Outbox is set up). See [destination-aware/README.md](./destination-aware/README.md) for deployment gotchas. |
 
-### 11. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
+### 12. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
 
 Merged skill that tracks both **"use it or lose it" credit card benefits** (monthly credits, quarterly categories, semi-annual windows) and **per-purchase reward optimization** ("which card for groceries?"). A weekly cron checks expiring benefits and notifies each cardholder with a tiered-brevity format — urgent and this-period items show full detail, while 30+ day items collapse into a single summary line to keep the message scannable. A monthly LLM-powered refresh searches the web for benefit and reward rate changes. Interactive queries recommend the optimal card per spending category with cap awareness and network acceptance warnings (Amex fallbacks).
 
@@ -181,7 +195,7 @@ Merged skill that tracks both **"use it or lose it" credit card benefits** (mont
 | **macOS-specific** | Apple Reminders via remindctl (optional — remove reminder creation for Linux) |
 | **Setup time** | ~10 minutes (after Outbox is set up) |
 
-### 12. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
+### 13. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
 
 Weekly meal planning that reads from your recipe database, checks pantry inventory, and generates shopping lists that feed directly into the Instacart API pipeline. Handles dietary restrictions, household coordination (adults vs kids), batch cooking, and budget tracking. Based on the [meal-planner](https://clawhub.com/skills/meal-planner) skill from ClawHub (by clawic), adapted to use SQLite-backed recipes and Instacart API CLI cart-building instead of static lists.
 
@@ -195,7 +209,7 @@ Weekly meal planning that reads from your recipe database, checks pantry invento
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes + first-use household onboarding conversation |
 
-### 13. [Apple Reminders](./apple-reminders/) — Full Reminders Management + Recurring Support
+### 14. [Apple Reminders](./apple-reminders/) — Full Reminders Management + Recurring Support
 
 Full Apple Reminders management via the `remindctl` CLI (view, add, edit, complete, delete, list routing) plus a compiled Swift binary for recurring reminders via EventKit. The `remindctl` CLI doesn't support recurrence natively, so the EventKit binary fills that gap.
 
@@ -209,7 +223,7 @@ Full Apple Reminders management via the `remindctl` CLI (view, add, edit, comple
 | **macOS-specific** | Yes (EventKit is Apple-only) |
 | **Setup time** | ~2 minutes (compile + grant permissions) |
 
-### 14. [Email PDF Attachment](./email-pdf-attachment/) — Native PDF Extraction from Email
+### 15. [Email PDF Attachment](./email-pdf-attachment/) — Native PDF Extraction from Email
 
 Skill instructions for finding Outlook/Gmail emails with PDF attachments, downloading them to an OpenClaw-allowed media path, and reading them through OpenClaw's native PDF capability. The scheduled Spratt email scan uses the same principle: PDF attachments are processed through OpenClaw's bundled `document-extract` PDF extractor before LLM structured extraction.
 
@@ -223,7 +237,7 @@ Skill instructions for finding Outlook/Gmail emails with PDF attachments, downlo
 | **macOS-specific** | No for extraction; downstream actions may use macOS Reminders/Calendar depending on the workflow |
 | **Setup time** | ~2 minutes if email auth is already configured |
 
-### 15. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
+### 16. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
 
 A routing table that maps user intents to the correct tool or skill. Covers messaging (live `message` vs scheduled `outbox`), productivity tools, web/browser, trips, email attachments, the "what are our plans?" multi-source check, forwarded-email semantics, and the cron-vs-outbox hard boundary. Also includes TaskFlow guidance for multi-step interactive workflows (trip planning, Instacart cart building, Resy bookings) that span multiple turns and need durable state tracking.
 
@@ -304,6 +318,20 @@ Email → email scan cron (Flash triage → extract)
               + "📦 Amazon — buy manually"
                     ↓
               outbox.sqlite → sender.py → iMessage
+
+launchd com.spratt.discovery-butler (daily 2pm, mostly silent)
+                    ↓
+              nudge.py — at home: Thu/Fri only; on trip: day 1–3 only
+                    ↓
+              wanderlust-goat-pp-cli goat <anchor> --criteria "third-wave coffee" --agent
+                    ↓
+              dedup vs places.sqlite (already-saved names) + business_status=OPERATIONAL
+                    ↓
+              openclaw infer model run --gateway --model openai-codex/gpt-5.5 (Flash fallback)
+                    ↓
+              outbox.sqlite → at-home: Manan + Harshita (separate); trip: trip.group_chat_guid
+                    ↓
+              discovery_fires.sqlite marks (person, kind, key) so it can't re-fire
 
 Human → "plan meals this week"
                     ↓
@@ -546,25 +574,34 @@ cd ../instacart-api
 # 15 min before reorder-nudge so the nudge reads its status).
 # Copy SKILL.md to your OpenClaw skills directory.
 
-# 8. Add Places
+# 8. Add Discovery Butler (casual coffee / quick-bite nudges)
+cd ../discovery-butler
+# Install wanderlust-goat-pp-cli from printing-press-library; export GOOGLE_PLACES_API_KEY.
+# Edit MANAN_PHONE / HARSHITA_PHONE + HA entity ids at the top of scripts/nudge.py.
+# Smoke-test: `python3 scripts/nudge.py --smoke` (compose + print, no outbox).
+# Drop scripts/nudge.py into your infrastructure dir.
+# Install shared/launchd/com.spratt.discovery-butler.plist.example (daily 2pm local).
+# Copy SKILL.md to your OpenClaw skills directory.
+
+# 9. Add Places
 cd ../places
 bash examples/setup.sh
 # Copy SKILL.md to your OpenClaw skills directory
 
-# 9. Add Destination-Aware Reminders
+# 10. Add Destination-Aware Reminders
 cd ../destination-aware
 # Configure HA_URL and HA_TOKEN in ~/.config/home-assistant/config.json
 # Set GOOGLE_PLACES_API_KEY for goplaces
 # Install launchd plist (see shared/launchd/)
 
-# 10. Add Card Wallet (benefits + purchase optimizer)
+# 11. Add Card Wallet (benefits + purchase optimizer)
 cd ../card-wallet
 cat schemas/cards.sql | sqlite3 ~/.config/spratt/db/cards.sqlite
 # Seed your cards, benefits, and reward rates
 # Configure HOLDER_RECIPIENTS in card-wallet-check.py
 # Add Saturday + monthly + quarterly cron jobs to OpenClaw
 
-# 11. Add Meal Planner
+# 12. Add Meal Planner
 cd ../meal-planner
 # Copy SKILL.md + reference docs to your OpenClaw skills directory
 # Requires recipes.sqlite (from recipe-instacart skill) and Instacart API (step 7)
