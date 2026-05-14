@@ -181,7 +181,21 @@ When you set a destination in your Tesla, this daemon detects it via Home Assist
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~10 minutes (after Outbox is set up). See [destination-aware/README.md](./destination-aware/README.md) for deployment gotchas. |
 
-### 12. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
+### 12. [Delivery Watcher](./delivery-watcher/) — On-Porch Package Alerts
+
+KeepAlive daemon that texts both principals when an Amazon or Instacart package is **delivered** and the front-door contact sensor hasn't changed state in the 5 minutes since. Carrier delivery confirmation (parsed by email-scan into `orders.sqlite`) is the trigger; the Ring door sensor in Home Assistant is the "did you already grab it" gate. No camera, no vision, no OCR — the carrier already tells us *which* order arrived.
+
+**Why it exists:** A delivery notification from the Amazon app says "delivered." It doesn't say "...and it's still sitting on your porch in the rain." This skill closes that loop — if you opened the front door within 5 minutes of the delivery, it stays silent. Otherwise both you and your partner get a one-line text so somebody grabs it before the porch pirate or the weather does.
+
+| | |
+|---|---|
+| **What you get** | `scripts/watch.py` (~240 lines, single-file daemon — polls orders.sqlite, queries HA, writes outbox), SKILL.md, launchd plist example |
+| **Dependencies** | `orders.sqlite` populated by an email-scan pipeline (see email-to-orders skill above), Home Assistant with a door contact sensor (`device_class=door`), Outbox CLI |
+| **Schedule** | launchd `com.spratt.delivery-watcher`, KeepAlive, 30s poll loop. First-run backfill silently marks existing delivered rows as already-notified so the daemon doesn't spam on startup. |
+| **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
+| **Setup time** | ~5 minutes once email-scan + HA + outbox are wired |
+
+### 13. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
 
 Merged skill that tracks both **"use it or lose it" credit card benefits** (monthly credits, quarterly categories, semi-annual windows) and **per-purchase reward optimization** ("which card for groceries?"). A weekly cron checks expiring benefits and notifies each cardholder with a tiered-brevity format — urgent and this-period items show full detail, while 30+ day items collapse into a single summary line to keep the message scannable. A monthly LLM-powered refresh searches the web for benefit and reward rate changes. Interactive queries recommend the optimal card per spending category with cap awareness and network acceptance warnings (Amex fallbacks).
 
@@ -195,7 +209,7 @@ Merged skill that tracks both **"use it or lose it" credit card benefits** (mont
 | **macOS-specific** | Apple Reminders via remindctl (optional — remove reminder creation for Linux) |
 | **Setup time** | ~10 minutes (after Outbox is set up) |
 
-### 13. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
+### 14. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
 
 Weekly meal planning that reads from your recipe database, checks pantry inventory, and generates shopping lists that feed directly into the Instacart API pipeline. Handles dietary restrictions, household coordination (adults vs kids), batch cooking, and budget tracking. Based on the [meal-planner](https://clawhub.com/skills/meal-planner) skill from ClawHub (by clawic), adapted to use SQLite-backed recipes and Instacart API CLI cart-building instead of static lists.
 
@@ -209,7 +223,7 @@ Weekly meal planning that reads from your recipe database, checks pantry invento
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes + first-use household onboarding conversation |
 
-### 14. [Apple Reminders](./apple-reminders/) — Full Reminders Management + Recurring Support
+### 15. [Apple Reminders](./apple-reminders/) — Full Reminders Management + Recurring Support
 
 Full Apple Reminders management via the `remindctl` CLI (view, add, edit, complete, delete, list routing) plus a compiled Swift binary for recurring reminders via EventKit. The `remindctl` CLI doesn't support recurrence natively, so the EventKit binary fills that gap.
 
@@ -223,7 +237,7 @@ Full Apple Reminders management via the `remindctl` CLI (view, add, edit, comple
 | **macOS-specific** | Yes (EventKit is Apple-only) |
 | **Setup time** | ~2 minutes (compile + grant permissions) |
 
-### 15. [Email PDF Attachment](./email-pdf-attachment/) — Native PDF Extraction from Email
+### 16. [Email PDF Attachment](./email-pdf-attachment/) — Native PDF Extraction from Email
 
 Skill instructions for finding Outlook/Gmail emails with PDF attachments, downloading them to an OpenClaw-allowed media path, and reading them through OpenClaw's native PDF capability. The scheduled Spratt email scan uses the same principle: PDF attachments are processed through OpenClaw's bundled `document-extract` PDF extractor before LLM structured extraction.
 
@@ -237,7 +251,7 @@ Skill instructions for finding Outlook/Gmail emails with PDF attachments, downlo
 | **macOS-specific** | No for extraction; downstream actions may use macOS Reminders/Calendar depending on the workflow |
 | **Setup time** | ~2 minutes if email auth is already configured |
 
-### 16. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
+### 17. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
 
 A routing table that maps user intents to the correct tool or skill. Covers messaging (live `message` vs scheduled `outbox`), productivity tools, web/browser, trips, email attachments, the "what are our plans?" multi-source check, forwarded-email semantics, and the cron-vs-outbox hard boundary. Also includes TaskFlow guidance for multi-step interactive workflows (trip planning, Instacart cart building, Resy bookings) that span multiple turns and need durable state tracking.
 
@@ -356,6 +370,19 @@ Tesla nav destination set → sensor.maha_tesla_destination changes
                 no match from any category → stay silent
                     ↓
               outbox.sqlite → sender.py → "🛒 Heading to QFC — cilantro, milk, paper towels"
+
+email-scan inserts orders.sqlite row: tracking_status='delivered', source IN (amazon,instacart)
+                    ↓
+              delivery-watcher.py daemon (KeepAlive, 30s poll)
+                    ↓
+              deliveries.sqlite — record + dedup on order_pk
+                    ↓
+              T+5min: GET /api/states/binary_sensor.<front_door>
+                    ↓
+              door last_changed >= delivery_ts ?
+                yes → silent (mark skipped='door changed at <iso>')
+                no  → outbox.sqlite → both principals (separate messages)
+                       "📦 Amazon delivered: <item> + N more. Still on porch."
 
 Saturday cron → card-wallet-check.py (deterministic)
                     ↓
@@ -594,14 +621,26 @@ cd ../destination-aware
 # Set GOOGLE_PLACES_API_KEY for goplaces
 # Install launchd plist (see shared/launchd/)
 
-# 11. Add Card Wallet (benefits + purchase optimizer)
+# 11. Add Delivery Watcher (on-porch package alerts)
+cd ../delivery-watcher
+# Requires orders.sqlite (from email-to-orders, step 4) + HA contact sensor on the front door + Outbox.
+# Find your door entity:
+#   curl -H "Authorization: Bearer $HA_TOKEN" $HA_URL/api/states \
+#     | jq -r '.[] | select(.attributes.device_class=="door") | .entity_id'
+# Edit DOOR_ENTITY + MANAN_PHONE + HARSHITA_PHONE at the top of scripts/watch.py.
+# Drop scripts/watch.py into your infrastructure dir.
+# Install shared/launchd/com.spratt.delivery-watcher.plist.example (KeepAlive, 30s poll).
+# First run silently backfills existing delivered rows — no spam on startup.
+# Copy SKILL.md to your OpenClaw skills directory.
+
+# 12. Add Card Wallet (benefits + purchase optimizer)
 cd ../card-wallet
 cat schemas/cards.sql | sqlite3 ~/.config/spratt/db/cards.sqlite
 # Seed your cards, benefits, and reward rates
 # Configure HOLDER_RECIPIENTS in card-wallet-check.py
 # Add Saturday + monthly + quarterly cron jobs to OpenClaw
 
-# 12. Add Meal Planner
+# 13. Add Meal Planner
 cd ../meal-planner
 # Copy SKILL.md + reference docs to your OpenClaw skills directory
 # Requires recipes.sqlite (from recipe-instacart skill) and Instacart API (step 7)
