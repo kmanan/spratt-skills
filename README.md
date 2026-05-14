@@ -74,16 +74,16 @@ An email scanning cron extracts grocery/shopping order details from email confir
 
 ### 5. [Instacart Orders](./instacart-orders/) — CLI-Driven Order History Pipeline
 
-Instacart has no clean GraphQL operation for order history — its own CLI (`instacart-pp-cli history sync`) is documented as broken upstream for that reason. The working path, ships [in the CLI's own docs](https://github.com/mvanhorn/printing-press-library), is a browser-side extractor that reads the Apollo cache on each order-detail page. This component wraps that extractor with a launchd-driven Python orchestrator that runs nightly, walks every order, and pipes each record to `instacart-pp-cli history import -` for durable storage in the CLI's local SQLite DB.
+A CLI-driven order-history pipeline. `instacart-pp-cli` owns the local SQLite DB, the canonical IDs, and the `history import` intake. The only browser involvement is a one-shot Apollo-cache read per order-detail page using `extract-one.js` — a snippet shipped inside the CLI's own `docs/` directory. Instacart has no clean GraphQL op for order history (the CLI's `history sync` command is documented as broken upstream for exactly that reason), so the CLI author prescribed this read-once-from-cache approach and we drive it from Python: launchd fires nightly, the orchestrator walks every order page, runs `extract-one.js` to capture the Apollo record, and pipes each JSON record to `instacart-pp-cli history import -` for durable storage.
 
 Per-order durability: the orchestrator extracts → imports → persists processed state after every order, so a mid-run crash never loses data. Each successful order is written to `~/Library/Application Support/instacart/instacart.db` (orders + order_items) with **canonical Instacart IDs** — `order_id`, `item_id` (`items_<retailerId>-<legacyId>`), `product_id`, retailer slug, delivered_at, and per-item quantity/quantity_type. Those canonical IDs are what makes deterministic cart-building (next sections) possible.
 
-**Why it exists:** Email confirmations don't carry itemized order details, and the older LLM-driven nightly scraper that read receipt pages was non-deterministic (mismatched orders, missed items, hallucinated prices). Replacing it with a deterministic browser-driven extractor against the Apollo cache eliminates that whole class of failure.
+**Why it exists:** Email confirmations don't carry itemized order details, and the older LLM-driven nightly scraper that read receipt pages was non-deterministic (mismatched orders, missed items, hallucinated prices). Replacing it with a deterministic CLI-owned import that reads from Instacart's own client-side Apollo cache eliminates that whole class of failure.
 
 | | |
 |---|---|
-| **What you get** | `history-scrape.py` (per-order extract→import via OpenClaw browser + CLI stdin), `cadence.py` (median day-gap per `(item_id, retailer_slug)` from the CLI DB), SKILL.md, launchd plist example |
-| **Dependencies** | `instacart-pp-cli` (from [printing-press-library](https://github.com/mvanhorn/printing-press-library)), OpenClaw browser tool, an active Instacart session (`auth login` or `auth paste`), Outbox (above) for failure alerts |
+| **What you get** | `history-scrape.py` (per-order extract→import via the CLI's bundled `extract-one.js` + CLI stdin), `cadence.py` (median day-gap per `(item_id, retailer_slug)` from the CLI DB), SKILL.md, launchd plist example |
+| **Dependencies** | `instacart-pp-cli` (from [printing-press-library](https://github.com/mvanhorn/printing-press-library)) which ships `docs/extract-one.js`, OpenClaw browser tool (only to load the order-detail page and run the CLI's extractor), an active Instacart session (`auth login` or `auth paste`), Outbox (above) for failure alerts |
 | **Schedule** | launchd `com.spratt.instacart-history-scrape` nightly at 9pm local. Incremental by default; `--backfill` walks every visible order. |
 | **macOS-specific** | launchd plist is macOS-specific; underlying script is portable to any cron. |
 | **Setup time** | ~15 minutes (once `instacart-pp-cli` is installed and logged in) |
@@ -115,7 +115,7 @@ The auto-replenishment loop (`cart-build.py`) runs on launchd Wed + Sat 7:45am P
 
 The bot builds the cart. Manan places the order. The CLI has no `place`/`checkout` action — that's an intentional design constraint.
 
-**Why it exists:** Browser cart-building (the [legacy Instacart Skill](./instacart-skill/), still in this repo for fallback) was 11/14 wrong on a typical run — Instacart's autosuggest matches "organic milk" with a non-organic shop's top result, the wrong unit, or last week's promotion. Once `instacart-pp-cli history import` has the canonical IDs locally, `--item-id` bypasses search entirely and adds the exact item that was bought before. Accuracy went to 100% with one tap to ship.
+**Why it exists:** The previous browser cart-building path (DOM-driven URL search + click-Add) was 11/14 wrong on a typical run — Instacart's autosuggest matches "organic milk" with a non-organic shop's top result, the wrong unit, or last week's promotion. Once `instacart-pp-cli history import` has the canonical IDs locally, `--item-id` bypasses search entirely and adds the exact item that was bought before. Accuracy went to 100% with one tap to ship.
 
 | | |
 |---|---|
@@ -124,8 +124,6 @@ The bot builds the cart. Manan places the order. The CLI has no `place`/`checkou
 | **Schedule** | launchd `com.spratt.instacart-cart-build` Wed + Sat 7:45am PT. Also invokable interactively for ad-hoc carts. |
 | **macOS-specific** | launchd plist is macOS-specific; underlying script is portable. |
 | **Setup time** | ~10 minutes (`instacart-pp-cli auth login` once, then drop the plist) |
-
-The legacy [Instacart Skill](./instacart-skill/) — browser-driven URL-based search + click-Add — remains in this repo with a deprecation banner. It's the last-resort fallback if `instacart-pp-cli auth` is wedged and `auth paste` is unavailable. For everything else, route to Instacart API for cart-build and Instacart Orders for history reads.
 
 ### 8. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
 
@@ -277,9 +275,10 @@ Email → email scan cron (Flash triage → extract)
 
               launchd com.spratt.instacart-history-scrape (nightly 9pm)
                     ↓
-              history-scrape.py drives OpenClaw browser through Instacart order-history page
+              history-scrape.py walks order-history page via OpenClaw browser
+              (Instacart has no GraphQL op for history; CLI's `history sync` is broken upstream)
                     ↓
-              extract-one.js (from instacart-pp-cli docs) reads Apollo cache per order
+              instacart-pp-cli ships docs/extract-one.js — one-shot Apollo cache reader, per order
                     ↓
               pipes each record to `instacart-pp-cli history import -` (stdin, per-order durable)
                     ↓
@@ -470,8 +469,7 @@ exist because an LLM was previously doing that job and doing it badly.
 
 Several components were built on top of skills from the [ClawHub](https://clawhub.com) marketplace:
 
-- **Instacart Skill** (legacy, browser-driven) is forked from [instacart-skill](https://clawhub.com/skills/instacart-skill) by bigdaddyluke. We replaced search-box typing with URL-based search, added snapshot-first browser interaction rules, integrated smart lookback via purchase cadence analysis, and added browser crash self-recovery. Auto-checkout is disabled. **Deprecated 2026-05-13** in favor of **Instacart API** (CLI-driven, deterministic, ~100% accurate vs ~3/14 wrong on the browser path). The legacy skill remains as fallback when the CLI auth is wedged.
-- **Instacart API** (CLI-driven cart-build) and **Instacart Orders** (CLI-driven history scrape) both ride on [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) by mvanhorn — a Go CLI that talks directly to Instacart's GraphQL endpoint and ships a working browser-side extractor for the one operation (order history) that GraphQL doesn't expose. The history scraper wraps the CLI's `docs/extract-one.js` companion with OpenClaw browser driving + per-order durable import.
+- **Instacart API** (CLI-driven cart-build) and **Instacart Orders** (CLI-driven history scrape) both ride on [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) by mvanhorn — a Go CLI that talks directly to Instacart's GraphQL endpoint. The CLI also ships `docs/extract-one.js`, a one-shot Apollo-cache reader for order history (the one operation Instacart's GraphQL doesn't expose). The history scraper wraps that CLI-bundled extractor with OpenClaw browser driving + per-order durable import — there is no non-browser path for history today, and this is the path the CLI's own docs prescribe. The previous browser-search cart skill ([instacart-skill](https://clawhub.com/skills/instacart-skill) by bigdaddyluke, forked) was deprecated 2026-05-13 and removed from this repo when Instacart API hit ~100% accuracy.
 - **Smart Reorder** feeds into Instacart API (above) for cart building. We added SQL-backed purchase cadence analysis (one cadence script per data source) and LLM item classification on the Amazon side.
 - **Card Wallet** merges our card-perks tracker with the [card-optimizer](https://clawhub.com/skills/card-optimizer) by scottfo. We unified the data store into SQLite (replacing the JSON file), added multi-holder support, and integrated quarterly management.
 - **Meal Planner** is based on the [meal-planner](https://clawhub.com/skills/meal-planner) by clawic. We rewired it to read from recipes.sqlite instead of markdown files and feed shopping lists into the Instacart API CLI pipeline instead of generating static lists.
@@ -547,8 +545,6 @@ cd ../instacart-api
 # Install shared/launchd/com.spratt.instacart-cart-build.plist.example (Wed + Sat 7:45am,
 # 15 min before reorder-nudge so the nudge reads its status).
 # Copy SKILL.md to your OpenClaw skills directory.
-# Optional fallback: instacart-skill/SKILL.md (browser-driven, deprecated) for cases
-# where the CLI auth is wedged.
 
 # 8. Add Places
 cd ../places

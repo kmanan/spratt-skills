@@ -74,7 +74,9 @@ and emits an outbox alert on uncaught failure.
   script records them under `errors` in the status JSON.
 - The CLI's own `history sync` command is documented as broken upstream
   ("Instacart has no clean GraphQL op for order history"). Don't use it.
-  Use the browser-driven `history-scrape.py` path above.
+  Use `history-scrape.py` above — it drives the CLI's own bundled
+  `docs/extract-one.js` (per-order Apollo cache reader) and pipes results
+  back through `instacart-pp-cli history import -`.
 - Auth: relies on the Chrome cookies that `instacart-pp-cli auth login`
   reads. If `auth status --json` returns `logged_in:false`, see the
   **instacart-api** skill for the recovery flow.
