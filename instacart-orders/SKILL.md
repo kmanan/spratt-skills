@@ -1,118 +1,94 @@
 ---
 name: instacart-orders
-description: Scrape Instacart order history via browser to get full itemized details (names, quantities, prices). Use when an Instacart order has missing items, or when asked to backfill order history.
-version: 1.0.0
+description: Read Instacart order history (canonical item IDs, retailer, dates) from the printing-press CLI's local SQLite DB. Trigger ad-hoc re-imports when the nightly history scrape is stale or missed an order.
+version: 2.0.0
 ---
 
-# Instacart Order Scraping
+# Instacart Order History
 
-Extracts full itemized order details from Instacart via browser automation.
-The email scanner detects Instacart orders but emails rarely contain item lists — this skill fills them in by scraping the Instacart account.
+Replaces the old browser-snapshot scraper (retired 2026-05-13) with a
+deterministic CLI-driven pipeline. Order history now lives in the
+`instacart-pp-cli` SQLite DB at
+`~/Library/Application Support/instacart/instacart.db` and is populated
+nightly by `~/.config/spratt/infrastructure/instacart/history-scrape.py`
+under launchd job `com.spratt.instacart-history-scrape`.
 
-## When to use
+## When to use this skill
 
-- After email scanner ingests an Instacart order with 0 or few items
-- When asked to backfill past Instacart orders
-- When asked "what was in the last Instacart order?"
+- "What was in the last Instacart order?" — query the CLI DB.
+- "When did I last buy X on Instacart?" — `history search X --json`.
+- "How often do I buy X?" — `~/.config/spratt/infrastructure/instacart/cadence.py --due-only`.
+- A nightly scrape missed a specific order and you want to import it now.
 
-## Step 1: Find orders needing items
+For *building* a cart (add items, place order) use the **instacart-api**
+skill instead.
 
-Check for Instacart orders with empty or missing items:
-
-```bash
-sqlite3 ~/.config/spratt/orders/orders.sqlite \
-  "SELECT id, order_id, order_date, items, total FROM orders WHERE source = 'instacart' AND (items = '[]' OR items = '' OR json_array_length(items) = 0) ORDER BY order_date DESC;"
-```
-
-If no orders need filling, stop here.
-
-## Step 2: Get order list from Instacart
-
-```
-openclaw browser navigate "https://www.instacart.com/store/account/orders"
-openclaw browser snapshot --format ai
-```
-
-This returns a list of past orders with:
-- Delivery date
-- Item count and total
-- **"View order detail" link** — URL like `/store/orders/ORDER_ID`
-- Store name (QFC, Costco, Safeway, etc.)
-
-Match orders from the database (by date + approximate total) to find the right detail URL.
-
-## Step 3: Get receipt with full item details
-
-From the order detail page, find the **"Receipt"** link. Navigate to it:
-
-```
-openclaw browser navigate "RECEIPT_URL"
-openclaw browser snapshot --format ai
-```
-
-The receipt page contains the full itemized breakdown organized by category:
-- Item name with size/variant (e.g., "Cilantro Bunch (1 bunch)")
-- Quantity (e.g., "2 x $4.99")
-- Final price after any loyalty savings
-
-**If you can't find the receipt link**, fall back to the order detail page — item names are in img alt text (no prices/quantities, but names are enough for search).
-
-## Step 4: Parse items into JSON
-
-Build a JSON array from the receipt. Each item:
-
-```json
-[
-  {"name": "Cilantro Bunch", "qty": 1, "price": 1.49},
-  {"name": "Simply Pulp Free Orange Juice Bottles", "qty": 1, "price": 7.99},
-  {"name": "LaCroix Sparkling Water, Orange", "qty": 2, "price": 8.58}
-]
-```
-
-**Rules:**
-- `name`: product name without size/variant in parentheses — keep it searchable
-- `qty`: number of units ordered (the "2 x" part)
-- `price`: final item price after loyalty savings (not original price)
-- Get the order total from the "Order Totals" section
-
-## Step 5: Update the order in the database
+## Read-only queries
 
 ```bash
-python3 ~/.config/spratt/infrastructure/orders/order-ingest.py update-items \
-  --source instacart \
-  --order-id "ORDER_ID" \
-  --items 'JSON_ARRAY' \
-  --total TOTAL \
-  --store STORE_NAME
+# Most-recent orders
+instacart-pp-cli history list --json --limit 20
+
+# All items at a single retailer, by purchase frequency
+instacart-pp-cli history list --store costco --json
+
+# Free-text search across purchased items
+instacart-pp-cli history search "honey roasted" --json
+
+# Order + item totals per retailer
+instacart-pp-cli history stats --json
 ```
 
-**Always include `--store`** (e.g. `qfc`, `costco`, `safeway`). The store name is visible on the order list and detail pages. This powers the purchase cadence analysis for smart reordering.
+The DB exposes canonical Instacart IDs:
 
-If the order doesn't exist yet (backfill), use insert mode:
+- `order_id` — 17–18 digit numeric (the Apollo cache id, not the URL id).
+- `item_id` — format `items_<retailerLocationId>-<legacyProductId>` (use this with `instacart-pp-cli add --item-id ...` to bypass autosuggest).
+- `product_id` — numeric, useful for cross-referencing.
+
+## Ad-hoc re-import (rare)
+
+If you know the nightly scrape missed a specific order — for example
+because the order is older than the "Load more" boundary at scrape time
+— trigger a manual import.
 
 ```bash
-python3 ~/.config/spratt/infrastructure/orders/order-ingest.py \
-  --source instacart \
-  --order-id "ORDER_ID" \
-  --date "YYYY-MM-DD" \
-  --items 'JSON_ARRAY' \
-  --total TOTAL \
-  --store STORE_NAME
+# Sweep everything visible on the order-history page (~3 hours wall
+# clock for 200+ orders). Idempotent — already-imported orders are
+# skipped by `history import`.
+python3 ~/.config/spratt/infrastructure/instacart/history-scrape.py --backfill
+
+# Or process only N new (un-tracked) orders. Useful for catch-up after
+# the launchd job has been off for a few days.
+python3 ~/.config/spratt/infrastructure/instacart/history-scrape.py --max-orders 30
 ```
 
-## Step 6: Confirm
+The script writes status to
+`~/.config/spratt/infrastructure/launchd-status/instacart-history-scrape.json`
+and emits an outbox alert on uncaught failure.
 
-After updating, verify:
+## Limits
 
-```bash
-sqlite3 ~/.config/spratt/orders/orders.sqlite \
-  "SELECT id, order_date, json_array_length(items) as item_count, total FROM orders WHERE source = 'instacart' ORDER BY order_date DESC LIMIT 5;"
-```
+- Some legacy orders return `cache_key_missing` during extraction (the
+  URL `order_id` doesn't line up with the Apollo cache key on a small
+  number of older orders). Those rows are skipped, not retried, and the
+  script records them under `errors` in the status JSON.
+- The CLI's own `history sync` command is documented as broken upstream
+  ("Instacart has no clean GraphQL op for order history"). Don't use it.
+  Use the browser-driven `history-scrape.py` path above.
+- Auth: relies on the Chrome cookies that `instacart-pp-cli auth login`
+  reads. If `auth status --json` returns `logged_in:false`, see the
+  **instacart-api** skill for the recovery flow.
 
-## Notes
+## What lives where now
 
-- **NEVER use `profile: "user"` with the browser** — always use the default `openclaw` profile
-- The receipt page is preferred over the order detail page because it has quantities and prices
-- Receipt URLs contain auth tokens and may expire — always navigate from the order detail page to get a fresh link
-- If "Load more orders" button appears on the orders list, click it for older orders
-- Order IDs on Instacart's site may not exactly match the order_id stored from email extraction — match by date + store instead
+| Old (pre-2026-05-13) | New |
+|---|---|
+| `orders.sqlite.orders` rows with `source='instacart'` | `instacart.db` `orders` + `order_items` tables |
+| Email-scan fabricated `email-XXX` order_ids when receipts had no number | Canonical numeric `order_id` from Apollo |
+| Nightly OpenClaw cron `Instacart Order Scraper` (agentTurn, Flash) | launchd `com.spratt.instacart-history-scrape` (deterministic Python) |
+| Purchase cadence: `purchase-cadence.py` against `orders.sqlite` for both Amazon and Instacart | `purchase-cadence.py` for Amazon only; `instacart/cadence.py` for Instacart |
+| Cart-build via browser autosuggest (`reorder-cart-build.py`) | `cart-build.py` via CLI `add --item-id` (canonical IDs) |
+
+The `orders.sqlite` rows that were already there stay there — they
+power the `orders` skill's interactive Q&A and the Amazon side of the
+reorder nudge. They're just no longer the source of truth for Instacart.

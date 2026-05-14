@@ -72,49 +72,60 @@ An email scanning cron extracts grocery/shopping order details from email confir
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
-### 5. [Instacart Orders](./instacart-orders/) — Browser-Based Order Scraping
+### 5. [Instacart Orders](./instacart-orders/) — CLI-Driven Order History Pipeline
 
-Instacart confirmation emails don't contain itemized order details — they just link to the Instacart site. This skill uses OpenClaw's browser automation to navigate to Instacart's receipt page and extract full item lists with names, quantities, and prices. Now also captures **store names** to power per-store purchase cadence analysis.
+Instacart has no clean GraphQL operation for order history — its own CLI (`instacart-pp-cli history sync`) is documented as broken upstream for that reason. The working path, ships [in the CLI's own docs](https://github.com/mvanhorn/printing-press-library), is a browser-side extractor that reads the Apollo cache on each order-detail page. This component wraps that extractor with a launchd-driven Python orchestrator that runs nightly, walks every order, and pipes each record to `instacart-pp-cli history import -` for durable storage in the CLI's local SQLite DB.
 
-**Why it exists:** The email scanner ingests Instacart orders with empty items because the email body doesn't have them. This skill closes the loop by scraping the data from the source.
+Per-order durability: the orchestrator extracts → imports → persists processed state after every order, so a mid-run crash never loses data. Each successful order is written to `~/Library/Application Support/instacart/instacart.db` (orders + order_items) with **canonical Instacart IDs** — `order_id`, `item_id` (`items_<retailerId>-<legacyId>`), `product_id`, retailer slug, delivered_at, and per-item quantity/quantity_type. Those canonical IDs are what makes deterministic cart-building (next sections) possible.
 
-| | |
-|---|---|
-| **What you get** | SKILL.md (browser scraping instructions), cron job template |
-| **Dependencies** | OpenClaw browser tool, Email-to-Orders (above), an active Instacart account logged in via the browser's `openclaw` profile |
-| **Schedule** | Cron, daily at 9pm. Finds orders with empty items, backfills them, and classifies new item names via Flash. |
-| **macOS-specific** | No |
-| **Setup time** | ~5 minutes (after Email-to-Orders is set up) |
-
-### 6. [Smart Reorder](./smart-reorder/) — Purchase Cadence Analysis + LLM Item Classification
-
-Analyzes your grocery purchase history to predict when you'll need to reorder each item. Calculates median days between purchases per product, flags items that are due or coming up soon. An LLM (Flash) classifies receipt item names into canonical products — so "QFC Vitamin D Whole Milk Half Gallon" and "QFC Vitamin D Whole Milk" are recognized as the same thing, while "Organic Valley Whole Milk" stays separate (different brand).
-
-Feeds into the [Instacart Skill](./instacart-skill/) (below) for cart building, and into `reorder-nudge.py` which sends a deterministic "🛒 Time to buy X" iMessage twice a week. The nudge is intentionally notification-only — no browser, no cart-building, no LLM at run time — because unattended Instacart automation has too many human-in-the-loop blockers (2FA, payment confirmation, item disambiguation). A `reorder_notifications` table tracks last-notified state per canonical item so the same thing doesn't get announced over and over until you actually buy it.
-
-**Why it exists:** "We're out of milk again" shouldn't require remembering. The system knows you buy milk every 7 days and your last order was 8 days ago — and on Wednesday morning it pings your phone with the list.
+**Why it exists:** Email confirmations don't carry itemized order details, and the older LLM-driven nightly scraper that read receipt pages was non-deterministic (mismatched orders, missed items, hallucinated prices). Replacing it with a deterministic browser-driven extractor against the Apollo cache eliminates that whole class of failure.
 
 | | |
 |---|---|
-| **What you get** | purchase-cadence.py (cadence analysis CLI, supports `--sources` for multi-source aggregation), item-classify.py (alias management CLI), reorder-nudge.py (iMessages "time to buy X" via the outbox, with per-item dedupe across runs), SQLite schema (item_aliases + reorder_notifications tables) |
-| **Dependencies** | Python 3, SQLite, Email-to-Orders + Instacart Orders (above) for data. Flash (via nightly cron) for item classification. Outbox (above) for reorder-nudge delivery. |
-| **Schedule** | Item classification runs as part of the nightly Instacart scraper cron. Cadence analysis is on-demand. Reorder-nudge fires twice weekly (Wed + Sat 8am local) via launchctl — no LLM at notification time, just SQL → text → outbox. |
-| **macOS-specific** | The reorder-nudge launchctl plist is macOS-specific; the underlying script is portable to any cron. |
+| **What you get** | `history-scrape.py` (per-order extract→import via OpenClaw browser + CLI stdin), `cadence.py` (median day-gap per `(item_id, retailer_slug)` from the CLI DB), SKILL.md, launchd plist example |
+| **Dependencies** | `instacart-pp-cli` (from [printing-press-library](https://github.com/mvanhorn/printing-press-library)), OpenClaw browser tool, an active Instacart session (`auth login` or `auth paste`), Outbox (above) for failure alerts |
+| **Schedule** | launchd `com.spratt.instacart-history-scrape` nightly at 9pm local. Incremental by default; `--backfill` walks every visible order. |
+| **macOS-specific** | launchd plist is macOS-specific; underlying script is portable to any cron. |
+| **Setup time** | ~15 minutes (once `instacart-pp-cli` is installed and logged in) |
+
+### 6. [Smart Reorder](./smart-reorder/) — Purchase Cadence + Dual-Source Reorder Nudge
+
+Predicts when each household item is due to be reordered based on median days between purchases. Two cadence sources, unioned by `canonical_key`:
+
+- **Amazon (legacy path):** `purchase-cadence.py` against `orders.sqlite`. An LLM (Flash) classifies receipt item names into canonical products — so "Bounty Paper Towels 12pk" and "Bounty Select-a-Size 12 Mega Rolls" are recognized as the same thing, while a different brand stays separate.
+- **Instacart (CLI path):** `cadence.py` against the printing-press CLI's SQLite DB (populated by [Instacart Orders](./instacart-orders/) above). No LLM classification needed — the CLI's canonical `item_id` IS the join key. "Same item" is determined by Instacart, not a heuristic.
+
+`reorder-nudge.py` queries both sources and ships one iMessage on Wed + Sat 8am PT. If `cart-build.py` (next section) ran 15 minutes earlier and staged anything, the message reframes from "due for reorder" to "🛒 Staged in Instacart cart — review and check out" and links to the checkout URL. Amazon items always appear under "📦 Amazon — buy manually". A `reorder_notifications` table tracks last-notified state per canonical key so the same item doesn't re-announce until it's actually purchased again.
+
+**Why it exists:** "We're out of milk again" shouldn't require remembering. The system knows you buy milk every 7 days, your last order was 8 days ago, and at 7:45am Wednesday morning it already filled a cart for you — at 8am it pings your phone telling you to open the Instacart app and check out.
+
+| | |
+|---|---|
+| **What you get** | `purchase-cadence.py` (Amazon-side cadence over orders.sqlite, supports `--sources`), `item-classify.py` (alias management CLI), `reorder-nudge.py` (dual-source nudge + cart-status-aware framing), SQLite schema (item_aliases + reorder_notifications tables) |
+| **Dependencies** | Python 3, SQLite, [Instacart Orders](./instacart-orders/) for the CLI cadence side, Email-to-Orders for the Amazon side, Outbox (above) for delivery |
+| **Schedule** | Item classification runs nightly. Cadence analysis is on-demand. Reorder-nudge fires Wed + Sat 8am PT via launchctl — no LLM at notification time, just SQL → text → outbox. |
+| **macOS-specific** | The reorder-nudge plist is macOS-specific; underlying script is portable. |
 | **Setup time** | ~5 minutes (after Instacart Orders is set up) |
 
-### 7. [Instacart Skill](./instacart-skill/) — Browser-Based Grocery Cart Building
+### 7. [Instacart API](./instacart-api/) — CLI-Driven Cart Building
 
-Drives a browser to build grocery carts on Instacart. The LLM searches products, adds items, handles quantity adjustments, and presents a cart summary — but never places the order. Originally from [instacart-skill](https://clawhub.com/skills/instacart-skill) on ClawHub (by bigdaddyluke), heavily customized with URL-based search (Instacart's search input doesn't work with Playwright), snapshot-first browser interaction rules, smart lookback integration via purchase cadence analysis, and automated browser crash recovery.
+Builds grocery carts on Instacart by calling `instacart-pp-cli add <retailer> --item-id <id>` against the canonical IDs captured by [Instacart Orders](./instacart-orders/) above. No browser, no DOM scraping, no autosuggest, no fuzzy matching. Direct GraphQL to Instacart's backend through the CLI's session. Warm calls are sub-second.
 
-**Why it exists:** Typing grocery lists into Instacart is tedious. "We need groceries" should result in a pre-built cart based on what you usually buy and what's due for reorder. The skill bridges the gap between the smart reorder analysis and the actual Instacart cart.
+The auto-replenishment loop (`cart-build.py`) runs on launchd Wed + Sat 7:45am PT — 15 minutes before the reorder nudge. It calls `cadence.py --due-only --format json` to get items due for reorder, then stages each one with `instacart-pp-cli add <retailer> --item-id <id> --qty N --yes`. It writes a status JSON; the reorder nudge reads it within a 45-minute window and changes its message from "due for reorder" to "🛒 Staged in Instacart cart". One human action: open the Instacart app, tap Place Order.
+
+The bot builds the cart. Manan places the order. The CLI has no `place`/`checkout` action — that's an intentional design constraint.
+
+**Why it exists:** Browser cart-building (the [legacy Instacart Skill](./instacart-skill/), still in this repo for fallback) was 11/14 wrong on a typical run — Instacart's autosuggest matches "organic milk" with a non-organic shop's top result, the wrong unit, or last week's promotion. Once `instacart-pp-cli history import` has the canonical IDs locally, `--item-id` bypasses search entirely and adds the exact item that was bought before. Accuracy went to 100% with one tap to ship.
 
 | | |
 |---|---|
-| **What you get** | SKILL.md (browser automation instructions with URL-based search, login flow, cart building, smart replenishment mode) |
-| **Dependencies** | OpenClaw browser tool, an active Instacart account, Smart Reorder (above) for purchase cadence data, `gog` CLI for login verification codes |
-| **Schedule** | N/A — interactive skill, invoked on demand or by smart replenishment automation. |
-| **macOS-specific** | No |
-| **Setup time** | ~5 minutes (after Smart Reorder is set up). Log into Instacart once in the `openclaw` browser profile. |
+| **What you get** | `cart-build.py` (deterministic cadence → cart staging via CLI), SKILL.md (full command surface, auth recovery flow, programmatic invocation contract for downstream skills), launchd plist example |
+| **Dependencies** | `instacart-pp-cli` (from [printing-press-library](https://github.com/mvanhorn/printing-press-library)), [Instacart Orders](./instacart-orders/) for the canonical IDs the CLI cadence reads, Outbox (above) for failure alerts |
+| **Schedule** | launchd `com.spratt.instacart-cart-build` Wed + Sat 7:45am PT. Also invokable interactively for ad-hoc carts. |
+| **macOS-specific** | launchd plist is macOS-specific; underlying script is portable. |
+| **Setup time** | ~10 minutes (`instacart-pp-cli auth login` once, then drop the plist) |
+
+The legacy [Instacart Skill](./instacart-skill/) — browser-driven URL-based search + click-Add — remains in this repo with a deprecation banner. It's the last-resort fallback if `instacart-pp-cli auth` is wedged and `auth paste` is unavailable. For everything else, route to Instacart API for cart-build and Instacart Orders for history reads.
 
 ### 8. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
 
@@ -174,14 +185,14 @@ Merged skill that tracks both **"use it or lose it" credit card benefits** (mont
 
 ### 12. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
 
-Weekly meal planning that reads from your recipe database, checks pantry inventory, and generates shopping lists that feed directly into the Instacart ordering pipeline. Handles dietary restrictions, household coordination (adults vs kids), batch cooking, and budget tracking. Based on the [meal-planner](https://clawhub.com/skills/meal-planner) skill from ClawHub (by clawic), adapted to use SQLite-backed recipes and the Instacart skill instead of standalone markdown files.
+Weekly meal planning that reads from your recipe database, checks pantry inventory, and generates shopping lists that feed directly into the Instacart API pipeline. Handles dietary restrictions, household coordination (adults vs kids), batch cooking, and budget tracking. Based on the [meal-planner](https://clawhub.com/skills/meal-planner) skill from ClawHub (by clawic), adapted to use SQLite-backed recipes and Instacart API CLI cart-building instead of static lists.
 
 **Why it exists:** Meal planning involves recipes you've saved, groceries you need to buy, and what's already in the pantry. Without integration, you're copying ingredient lists from one app to another. This connects the recipe database to the grocery pipeline so "plan this week's meals" ends with "cart built on Instacart, ready to place."
 
 | | |
 |---|---|
 | **What you get** | SKILL.md (planning instructions integrated with recipes.sqlite + Instacart pipeline), setup.md, shopping-guide.md, meal-prep.md, budget-tips.md, memory-template.md |
-| **Dependencies** | recipes.sqlite (from recipe-instacart skill), orders.sqlite (for purchase history), Instacart ordering skill (for cart building) |
+| **Dependencies** | recipes.sqlite (from recipe-instacart skill), orders.sqlite + instacart.db (for purchase history), Instacart API (for cart building) |
 | **Schedule** | N/A — interactive skill, invoked on demand when user wants to plan meals. |
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes + first-use household onboarding conversation |
@@ -264,19 +275,36 @@ Email → email scan cron (Flash triage → extract)
               trip-db.py → trips.sqlite
               outlook-calendar.sh → Outlook calendar (with attendees + notes)
 
-              Instacart scraper cron (daily, browser automation)
+              launchd com.spratt.instacart-history-scrape (nightly 9pm)
                     ↓
-              instacart.com/orders → receipt page → parse items
+              history-scrape.py drives OpenClaw browser through Instacart order-history page
                     ↓
-              order-ingest.py update-items → orders.sqlite (fills in items + store)
+              extract-one.js (from instacart-pp-cli docs) reads Apollo cache per order
                     ↓
-              item-classify.py → Flash classifies product names → item_aliases table
+              pipes each record to `instacart-pp-cli history import -` (stdin, per-order durable)
+                    ↓
+              ~/Library/Application Support/instacart/instacart.db (orders + order_items, canonical IDs)
 
-Human → "we need groceries"
+              launchd com.spratt.instacart-cart-build (Wed + Sat 7:45am)
                     ↓
-              purchase-cadence.py → median days between purchases per item
+              cart-build.py → cadence.py --due-only (median day-gap per item_id, retailer)
                     ↓
-              due items → Instacart skill (browser) → cart built → user places order
+              `instacart-pp-cli add <retailer> --item-id <id> --qty N --yes` per due item
+                    ↓
+              Instacart cart staged (CLI has no `place` — Manan opens app, taps Place Order)
+                    ↓
+              launchd-status/instacart-cart-build.json (consumed by reorder-nudge below)
+
+              launchd com.spratt.reorder-nudge (Wed + Sat 8am, 15 min after cart-build)
+                    ↓
+              fetch Amazon cadence (purchase-cadence.py → orders.sqlite, Flash item-classify)
+              fetch Instacart cadence (cadence.py → instacart.db, canonical item_id join)
+                    ↓
+              if cart-build status ≤45 min old: "🛒 Staged in Instacart cart — review & checkout"
+              else: "🛒 Instacart — due for reorder" (manual)
+              + "📦 Amazon — buy manually"
+                    ↓
+              outbox.sqlite → sender.py → iMessage
 
 Human → "plan meals this week"
                     ↓
@@ -284,7 +312,7 @@ Human → "plan meals this week"
                     ↓
               weekly plan + ingredient list
                     ↓
-              Instacart skill (browser) → cart built → user places order
+              Instacart API (CLI) → cart staged → Manan taps Place Order in app
 
 Tesla nav destination set → sensor.maha_tesla_destination changes
                     ↓
@@ -442,10 +470,11 @@ exist because an LLM was previously doing that job and doing it badly.
 
 Several components were built on top of skills from the [ClawHub](https://clawhub.com) marketplace:
 
-- **Instacart Skill** is forked from [instacart-skill](https://clawhub.com/skills/instacart-skill) by bigdaddyluke. We replaced search-box typing with URL-based search (Instacart's search input doesn't work with Playwright), added snapshot-first browser interaction rules, integrated smart lookback via purchase cadence analysis, and added browser crash self-recovery. Auto-checkout is disabled.
-- **Smart Reorder** feeds into the Instacart Skill (above) for cart building. We added SQL-backed purchase cadence analysis and LLM item classification.
+- **Instacart Skill** (legacy, browser-driven) is forked from [instacart-skill](https://clawhub.com/skills/instacart-skill) by bigdaddyluke. We replaced search-box typing with URL-based search, added snapshot-first browser interaction rules, integrated smart lookback via purchase cadence analysis, and added browser crash self-recovery. Auto-checkout is disabled. **Deprecated 2026-05-13** in favor of **Instacart API** (CLI-driven, deterministic, ~100% accurate vs ~3/14 wrong on the browser path). The legacy skill remains as fallback when the CLI auth is wedged.
+- **Instacart API** (CLI-driven cart-build) and **Instacart Orders** (CLI-driven history scrape) both ride on [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) by mvanhorn — a Go CLI that talks directly to Instacart's GraphQL endpoint and ships a working browser-side extractor for the one operation (order history) that GraphQL doesn't expose. The history scraper wraps the CLI's `docs/extract-one.js` companion with OpenClaw browser driving + per-order durable import.
+- **Smart Reorder** feeds into Instacart API (above) for cart building. We added SQL-backed purchase cadence analysis (one cadence script per data source) and LLM item classification on the Amazon side.
 - **Card Wallet** merges our card-perks tracker with the [card-optimizer](https://clawhub.com/skills/card-optimizer) by scottfo. We unified the data store into SQLite (replacing the JSON file), added multi-holder support, and integrated quarterly management.
-- **Meal Planner** is based on the [meal-planner](https://clawhub.com/skills/meal-planner) by clawic. We rewired it to read from recipes.sqlite instead of markdown files and feed shopping lists into the Instacart pipeline instead of generating static lists.
+- **Meal Planner** is based on the [meal-planner](https://clawhub.com/skills/meal-planner) by clawic. We rewired it to read from recipes.sqlite instead of markdown files and feed shopping lists into the Instacart API CLI pipeline instead of generating static lists.
 
 ---
 
@@ -494,24 +523,32 @@ cd ../email-to-orders
 cat schemas/orders.sql | sqlite3 ~/.config/spratt/db/orders.sqlite
 # Add the email scan cron prompt to your OpenClaw cron jobs
 
-# 5. Add Instacart Orders (fills in items the email scanner can't get)
+# 5. Add Instacart Orders (CLI-driven history scrape)
 cd ../instacart-orders
-# Copy SKILL.md to your OpenClaw skills directory
-# Add the daily scraper cron job (see SKILL.md for cron template)
-# Make sure the openclaw browser profile is logged into Instacart
+# Install instacart-pp-cli from https://github.com/mvanhorn/printing-press-library
+# Authenticate: `instacart-pp-cli auth login` (Chrome must be quit), or
+#               `instacart-pp-cli auth paste` (paste Cookie header from DevTools).
+# Drop scripts/history-scrape.py + scripts/cadence.py into your infrastructure dir.
+# Install shared/launchd/com.spratt.instacart-history-scrape.plist.example (edit paths).
+# First-run backfill: `python3 history-scrape.py --backfill --max-orders 250`
+# Copy SKILL.md to your OpenClaw skills directory.
 
-# 6. Add Smart Reorder (purchase cadence + item classification)
+# 6. Add Smart Reorder (dual-source cadence + cart-aware nudge)
 cd ../smart-reorder
-# purchase-cadence.py and item-classify.py go in your orders infrastructure dir
-# The nightly scraper cron handles item classification automatically
-# Run a one-time backfill of Instacart order history for initial data
+# purchase-cadence.py + item-classify.py go in your orders infrastructure dir (Amazon side).
+# Drop scripts/reorder-nudge.py into your orders infrastructure dir.
+# Install shared/launchd/com.spratt.reorder-nudge.plist.example (Wed + Sat 8am).
+# The nudge auto-detects cart-build status if you set up Instacart API (next step).
 
-# 7. Add Instacart Skill (browser-based cart building)
-cd ../instacart-skill
-# Copy SKILL.md to your OpenClaw skills directory
-# Log into Instacart once in the openclaw browser profile
-# Create memory/instacart-storefronts.json with your store slug mappings
-# Set INSTACART_URL, INSTACART_EMAIL in your agent's env file
+# 7. Add Instacart API (CLI-driven cart building)
+cd ../instacart-api
+# Requires instacart-pp-cli + an active session (step 5 already did this).
+# Drop scripts/cart-build.py into your infrastructure dir.
+# Install shared/launchd/com.spratt.instacart-cart-build.plist.example (Wed + Sat 7:45am,
+# 15 min before reorder-nudge so the nudge reads its status).
+# Copy SKILL.md to your OpenClaw skills directory.
+# Optional fallback: instacart-skill/SKILL.md (browser-driven, deprecated) for cases
+# where the CLI auth is wedged.
 
 # 8. Add Places
 cd ../places
@@ -534,7 +571,7 @@ cat schemas/cards.sql | sqlite3 ~/.config/spratt/db/cards.sqlite
 # 11. Add Meal Planner
 cd ../meal-planner
 # Copy SKILL.md + reference docs to your OpenClaw skills directory
-# Requires recipes.sqlite (from recipe-instacart skill) and Instacart skill
+# Requires recipes.sqlite (from recipe-instacart skill) and Instacart API (step 7)
 # First use triggers household onboarding conversation
 ```
 
@@ -564,7 +601,7 @@ This system has been running in production for a household of 4 (2 adults, 2 kid
 - Daily morning briefings and evening digests for 2 adults
 - Email scanning across 4 accounts (2 Gmail, 2 Outlook)
 - Smart home control via Home Assistant
-- Grocery order tracking with purchase cadence analysis across 5+ weekly Instacart orders
+- Grocery order tracking with purchase cadence analysis across 5+ weekly Instacart orders + a one-time backfill of 139 historical orders (1,111 items, 14 retailers) into the printing-press CLI's local SQLite — the cadence engine now joins on canonical Instacart `item_id` rather than fuzzy-matched receipt names
 - Destination-aware reminders via Tesla navigation + Google Places
 - Credit card benefit tracking across 6 cards, 14 benefits, and 24 reward rate categories
 

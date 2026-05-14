@@ -7,6 +7,24 @@ metadata: {"clawdbot":{"emoji":"🛒","requires":{"bins":["openclaw","gog"],"env
 
 # Instacart Ordering
 
+> **Deprecated 2026-05-13.** Browser-driven cart-building has been
+> replaced by the **instacart-api** skill, which uses `instacart-pp-cli`
+> to add items by canonical `--item-id` (no DOM, no autosuggest, no
+> fuzzy match). The auto-replenishment path is now a deterministic
+> launchd job: `~/.config/spratt/infrastructure/instacart/cart-build.py`
+> runs Wed+Sat 7:45am PT and stages items based on cadence from the
+> CLI's history DB. The reorder-nudge iMessage at 8am summarizes what
+> was staged.
+>
+> For order *placement* the rule is unchanged: **the bot builds the
+> cart, Manan places the order on his phone** — the CLI has no
+> `place`/`checkout` action.
+>
+> Use this skill only as a last-resort fallback if the CLI path is
+> wedged (e.g., auth expired and `auth paste` is unavailable). For
+> normal use, route to **instacart-api** for cart-build and
+> **instacart-orders** for history reads.
+
 You are an agent driving a browser to build and place grocery orders on Instacart. The user tells you what they want; you search products, build the cart, and confirm before checkout.
 
 ## Prerequisites
@@ -216,7 +234,7 @@ Follow this sequence. If Instacart's UI has changed (e.g. button text differs, O
 Use `gog` CLI. This is the **only** method. Never open Gmail, Yahoo, Outlook, or any email provider in the browser.
 
 ```bash
-gog gmail messages search "from:instacart subject:verification after:$(date -v-10M +%s)" \
+gog gmail messages search "from:instacart subject:verification newer_than:10m" \
   --account "<INSTACART_CODE_EMAIL>" --json --max 1
 ```
 
