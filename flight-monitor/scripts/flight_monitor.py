@@ -135,6 +135,9 @@ def get_primary_recipient(trip_id, group_chat_guid):
     Group chat GUID on the trip takes precedence. Otherwise the first traveler's
     phone (solo-trip convention: trip person gets the alert). Returns None if
     neither is available (caller logs and skips).
+
+    Watcher rows (role='watcher') are excluded — they are additive recipients
+    layered on top of the primary, handled separately by get_watchers().
     """
     if group_chat_guid:
         return group_chat_guid
@@ -142,10 +145,29 @@ def get_primary_recipient(trip_id, group_chat_guid):
         row = conn.execute(
             """SELECT phone FROM travelers
                WHERE trip_id = ? AND phone IS NOT NULL
+                 AND (role IS NULL OR role != 'watcher')
                ORDER BY id LIMIT 1""",
             (trip_id,),
         ).fetchone()
     return row["phone"] if row and row["phone"] else None
+
+
+def get_watchers(trip_id):
+    """Return list of {name, phone} dicts for watcher rows on this trip.
+
+    Empty list when no watchers exist — that's the baseline state and the
+    expected case for every trip that hasn't been opted in. NULL-phone rows
+    are returned too so notify() can surface them as failures rather than
+    dropping silently.
+    """
+    with db_conn() as conn:
+        rows = conn.execute(
+            """SELECT name, phone FROM travelers
+               WHERE trip_id = ? AND role = 'watcher'
+               ORDER BY id""",
+            (trip_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def update_flight(flight_id, **fields):
@@ -300,6 +322,51 @@ def notify(flight, text):
         trip_id=flight["trip_id"],
     )
     log.info(f"Queued to outbox: {source} → {recipient}")
+
+    # Watcher fanout — additive, silent when no watchers exist. A failure anywhere
+    # in this block must NOT affect the primary delivery above. Every failure path
+    # surfaces to Manan via system_alert so nothing dies quietly.
+    try:
+        watchers = get_watchers(flight["trip_id"])
+    except Exception as e:
+        log.exception(f"{flight['flight_number']}: get_watchers failed: {e}")
+        system_alert(flight, f"Watcher query failed for {flight['flight_number']} (trip {flight['trip_id']}): {e}", "watcher-query-failed")
+        watchers = []
+
+    watcher_source = f"flight:{flight['flight_number']}:watcher"
+    for w in watchers:
+        phone = w.get("phone")
+        name = w.get("name") or "(unnamed)"
+        if not phone:
+            log.warning(f"{flight['flight_number']}: watcher '{name}' has no phone — skipping")
+            system_alert(
+                flight,
+                f"Watcher '{name}' on trip {flight['trip_id']} has no phone — flight alerts can't reach them. Fix via trip-db.py.",
+                "watcher-bad-phone",
+            )
+            continue
+        if phone == recipient:
+            log.info(f"{flight['flight_number']}: watcher {phone} == primary recipient, skipping dedup")
+            continue
+        try:
+            get_outbox().schedule(
+                recipient=phone,
+                body=text,
+                send_at="now",
+                source=watcher_source,
+                created_by="flight-monitor",
+                priority=10,
+                trip_id=flight["trip_id"],
+            )
+            log.info(f"Queued watcher copy: {watcher_source} → {phone} ({name})")
+        except Exception as e:
+            log.exception(f"{flight['flight_number']}: watcher fanout to {phone} failed: {e}")
+            system_alert(
+                flight,
+                f"Watcher fanout to {name} ({phone}) failed for {flight['flight_number']}: {e}",
+                "watcher-fanout-failed",
+            )
+            # Continue — one watcher's failure must not block the others.
 
 
 def system_alert(flight, text, tag):

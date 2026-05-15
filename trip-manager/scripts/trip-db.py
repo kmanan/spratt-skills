@@ -296,9 +296,10 @@ def now_utc():
 
 
 def update_travelers_display(conn, trip_id):
-    """Update trips.travelers display column from travelers table."""
+    """Update trips.travelers display column from travelers table. Watchers (role='watcher') are excluded — they're additive recipients, not trip participants."""
     rows = conn.execute(
-        "SELECT name FROM travelers WHERE trip_id = ? ORDER BY id", (trip_id,)
+        "SELECT name FROM travelers WHERE trip_id = ? AND (role IS NULL OR role != 'watcher') ORDER BY id",
+        (trip_id,),
     ).fetchall()
     if rows:
         display = ", ".join(r["name"] for r in rows)
@@ -707,6 +708,108 @@ def cmd_add_traveler(args):
     print(f"  phone: {row['phone'] or '(not set)'}")
     if row['role']:
         print(f"  role:  {row['role']}")
+
+
+def cmd_add_watcher(args):
+    """Add a watcher to a trip — additive recipient who receives copies of all flight events.
+
+    Watchers are NOT primary recipients (group_chat_guid / first traveler logic is untouched).
+    Phone is resolved via contacts.sqlite by name; --phone is an explicit override for people
+    not yet in contacts. Group-chat handles are rejected — watchers must be individuals.
+
+    Every failure mode queues an outbox alert to Manan via _notify_manan. No silent failures.
+    """
+    conn = get_db()
+    ensure_schema(conn)
+
+    try:
+        ensure_trip_exists(conn, args.trip)
+    except SystemExit:
+        _notify_manan(
+            f"add-watcher failed: trip '{args.trip}' not found in trips.sqlite.",
+            "trip-db:add-watcher:no-trip",
+        )
+        raise
+
+    # Resolve phone: explicit --phone wins, else contacts lookup by name.
+    phone = None
+    canonical = None
+    if args.phone:
+        if not args.phone.startswith("+"):
+            msg = f"add-watcher failed: --phone '{args.phone}' must be E.164 format (e.g., +13157082088)."
+            print(f"ERROR: {msg}", file=sys.stderr)
+            _notify_manan(msg, "trip-db:add-watcher:bad-phone")
+            conn.close()
+            sys.exit(1)
+        phone = args.phone
+    else:
+        handle, canonical = _resolve_contact(args.name)
+        if not handle:
+            msg = (
+                f"add-watcher failed: '{args.name}' not in contacts.sqlite and no --phone given. "
+                f"Add to contacts or pass --phone +E164. Trip: {args.trip}."
+            )
+            print(f"ERROR: {msg}", file=sys.stderr)
+            _notify_manan(msg, "trip-db:add-watcher:no-contact")
+            conn.close()
+            sys.exit(1)
+        if not handle.startswith("+"):
+            msg = (
+                f"add-watcher failed: '{args.name}' resolved to '{handle}' which is a group-chat handle, "
+                f"not a phone. Watchers must be individuals (flight events route per-person). Trip: {args.trip}."
+            )
+            print(f"ERROR: {msg}", file=sys.stderr)
+            _notify_manan(msg, "trip-db:add-watcher:group-handle")
+            conn.close()
+            sys.exit(1)
+        phone = handle
+
+    display_name = canonical or args.name
+
+    # Reject duplicate watcher on this trip (same phone OR same name with role='watcher').
+    dup = conn.execute(
+        "SELECT id, name, phone FROM travelers WHERE trip_id = ? AND role = 'watcher' AND (phone = ? OR name = ?)",
+        (args.trip, phone, display_name),
+    ).fetchone()
+    if dup:
+        msg = (
+            f"add-watcher: '{display_name}' ({phone}) is already a watcher on trip {args.trip} "
+            f"(existing row id={dup['id']}). No change."
+        )
+        print(f"NOTE: {msg}", file=sys.stderr)
+        # Not an error — duplicate add is idempotent. Don't alert Manan; just exit 0 with a note.
+        conn.close()
+        sys.exit(0)
+
+    try:
+        conn.execute(
+            "INSERT INTO travelers (trip_id, name, phone, role) VALUES (?, ?, ?, 'watcher')",
+            (args.trip, display_name, phone),
+        )
+        # Watchers are excluded from update_travelers_display by design, but call it for symmetry
+        # so trips.travelers stays correct if a watcher add happens concurrently with other changes.
+        update_travelers_display(conn, args.trip)
+        conn.commit()
+    except Exception as e:
+        msg = f"add-watcher failed: DB insert error on trip {args.trip} for {display_name} ({phone}): {e}"
+        print(f"ERROR: {msg}", file=sys.stderr)
+        _notify_manan(msg, "trip-db:add-watcher:db-error")
+        conn.close()
+        sys.exit(1)
+
+    row = conn.execute(
+        "SELECT id FROM travelers WHERE trip_id = ? AND phone = ? AND role = 'watcher'",
+        (args.trip, phone),
+    ).fetchone()
+    conn.close()
+
+    print(f"OK: Watcher added")
+    print(f"  id:    {row['id']}")
+    print(f"  trip:  {args.trip}")
+    print(f"  name:  {display_name}")
+    print(f"  phone: {phone}")
+    print(f"  role:  watcher")
+    print(f"  → will receive a copy of every flight event for this trip, in addition to the primary recipient.")
 
 
 def cmd_update_trip(args):
@@ -1310,7 +1413,16 @@ def build_parser():
     p.add_argument("--trip", required=True, help="Trip ID")
     p.add_argument("--name", required=True, help="Traveler name")
     p.add_argument("--phone", help="Phone number in E.164 format (e.g., +15551234567)")
-    p.add_argument("--role", help="Role (e.g., primary, companion)")
+    p.add_argument("--role", help="Role (e.g., primary, companion). To add a watcher, use `add-watcher` instead.")
+
+    # add-watcher
+    p = sub.add_parser(
+        "add-watcher",
+        help="Add a watcher (additive recipient for flight events) by name; phone resolved via contacts",
+    )
+    p.add_argument("--trip", required=True, help="Trip ID")
+    p.add_argument("--name", required=True, help="Watcher name (looked up in contacts.sqlite)")
+    p.add_argument("--phone", help="Override phone (E.164). If omitted, resolved from contacts.")
 
     # update-trip
     p = sub.add_parser("update-trip", help="Update trip fields")
@@ -1390,6 +1502,7 @@ def main():
         "add-hotel": cmd_add_hotel,
         "add-reservation": cmd_add_reservation,
         "add-traveler": cmd_add_traveler,
+        "add-watcher": cmd_add_watcher,
         "update-trip": cmd_update_trip,
         "update-flight": cmd_update_flight,
         "update-reservation": cmd_update_reservation,

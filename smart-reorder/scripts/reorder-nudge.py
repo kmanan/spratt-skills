@@ -27,6 +27,10 @@ import time
 import traceback
 from datetime import datetime, timezone
 
+# launchd Weekday: Sun=0, Mon=1, ..., Sat=6. Python weekday(): Mon=0..Sun=6.
+# Cart-build runs Wed (launchd 3 == Python 2) and Sat (launchd 6 == Python 5).
+CART_BUILD_DAYS_PY = {2, 5}
+
 HOME = os.path.expanduser("~")
 ORDERS_DB = f"{HOME}/.config/spratt/db/orders.sqlite"
 CADENCE_LEGACY = f"{HOME}/.config/spratt/infrastructure/orders/purchase-cadence.py"
@@ -38,6 +42,10 @@ RECIPIENT = "+13157082088"
 LEGACY_SOURCES = "amazon"
 SOURCE_TAG = "reorder-nudge"
 CART_STATUS_MAX_AGE_SEC = 45 * 60
+CART_BUILD_SCRIPT = f"{HOME}/.config/spratt/infrastructure/instacart/cart-build.py"
+# 12 items × ~60s CLI timeout each is the worst case; pad to 6 min for the
+# self-heal subprocess so a hung CLI can't block the user-facing nudge forever.
+CART_BUILD_SELF_HEAL_TIMEOUT_SEC = 360
 
 
 def ensure_schema(conn):
@@ -121,9 +129,24 @@ def compose(new_items, cart_status):
     """Build the iMessage body. Instacart items get a 'staged' framing if
     cart-build ran recently and reported them; amazon stays manual."""
     staged_by_retailer = {}
-    if cart_status and cart_status.get("status") == "ok":
+    failed_entries = []
+    # Reject dry-run/phantom-staged entries — they represent cart-build runs
+    # that did not actually mutate the cart. Treating them as staged would
+    # mislead Manan ("Staged in cart" message with nothing in the cart).
+    if (
+        cart_status
+        and cart_status.get("status") == "ok"
+        and not cart_status.get("dry_run")
+    ):
         for s in cart_status.get("staged", []):
+            if "dry-run" in (s.get("mutation_status") or ""):
+                continue
             staged_by_retailer.setdefault(s["retailer_slug"], []).append(s)
+        # Surface cart-build's per-item failures in the user-facing message
+        # so partial failures don't silently disappear. The cart-build alert
+        # only names one example; this adds the full list.
+        for e in cart_status.get("errors", []) or []:
+            failed_entries.append(e)
 
     instacart_items = [i for i in new_items if i.get("origin") == "instacart"]
     amazon_items = [i for i in new_items if i.get("origin") == "amazon"]
@@ -136,6 +159,13 @@ def compose(new_items, cart_status):
             for retailer, rows in staged_by_retailer.items():
                 pretty = ", ".join(f"{r['name']} ×{r['quantity']}" for r in rows)
                 lines.append(f"• {retailer.title()} ({len(rows)}): {pretty}")
+            if failed_entries:
+                lines.append("")
+                lines.append(f"⚠️ Failed to stage ({len(failed_entries)}) — buy manually:")
+                for e in failed_entries:
+                    lines.append(
+                        f"• [{e.get('retailer_slug','?')}] {e.get('name','?')}"
+                    )
             lines.append("Review & check out: https://www.instacart.com/store/checkout")
         else:
             lines.append("🛒 Instacart — due for reorder:")
@@ -169,6 +199,58 @@ def send_outbox(body, source):
     )
 
 
+def self_heal_cart_build():
+    """Run cart-build.py inline when its scheduled cron didn't fire.
+
+    Returns (succeeded, detail) where succeeded is True iff cart-build exited 0
+    AND wrote a fresh status file. detail is a human-readable string for the
+    alert in either case.
+    """
+    started = time.time()
+    try:
+        r = subprocess.run(
+            ["python3", CART_BUILD_SCRIPT],
+            capture_output=True, text=True,
+            timeout=CART_BUILD_SELF_HEAL_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {CART_BUILD_SELF_HEAL_TIMEOUT_SEC}s"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+    elapsed = int(time.time() - started)
+    if r.returncode != 0:
+        return False, f"exit={r.returncode} after {elapsed}s, stderr={r.stderr.strip()[:200]}"
+    # cart-build's own error path also exits non-zero, so reaching here means
+    # cart-build wrote a fresh "ok" status. The compose() filters still apply.
+    return True, f"cart-build self-heal succeeded in {elapsed}s"
+
+
+def cart_build_missed_fire(cart_status, instacart_due_count):
+    """On scheduled cart-build days, detect when cart-build didn't run.
+    Returns a short alert string or None. Triggers only when there's
+    actually something for cart-build to have staged (instacart items
+    due) — otherwise a missed cron is indistinguishable from a no-op."""
+    if datetime.now().weekday() not in CART_BUILD_DAYS_PY:
+        return None
+    if instacart_due_count <= 0:
+        return None
+    if cart_status is None:
+        return (
+            "⚠️ Cart-build didn't run today (Wed/Sat 7:45am PT) AND inline "
+            "self-heal also failed — no fresh status file at "
+            f"{CART_BUILD_STATUS}. {instacart_due_count} Instacart item(s) due. "
+            "Falling back to legacy 'buy manually' framing. "
+            "Check launchctl print gui/$(id -u)/com.spratt.instacart-cart-build."
+        )
+    if cart_status.get("status") == "ERROR":
+        return (
+            f"⚠️ Cart-build ran but errored: {cart_status.get('error','?')}. "
+            f"{instacart_due_count} Instacart item(s) still due. Falling back."
+        )
+    return None
+
+
 def main():
     try:
         items = fetch_due_items()
@@ -181,6 +263,43 @@ def main():
                       f"({len(items)} due total, all already notified)")
                 return
             cart_status = load_recent_cart_status()
+            instacart_due_count = sum(
+                1 for i in new_due if i.get("origin") == "instacart"
+            )
+            # Self-heal: if today is Wed/Sat (cart-build day), instacart items
+            # are due, and cart-build hasn't left a fresh status file, run it
+            # inline before composing. Closes the "cron silently didn't fire"
+            # gap with a same-process recovery.
+            if (
+                datetime.now().weekday() in CART_BUILD_DAYS_PY
+                and instacart_due_count > 0
+                and cart_status is None
+            ):
+                print(f"[{datetime.now().isoformat()}] no fresh cart-build status; "
+                      f"running cart-build inline (self-heal)")
+                ok, detail = self_heal_cart_build()
+                print(f"[{datetime.now().isoformat()}] self-heal: ok={ok} {detail}")
+                if not ok:
+                    try:
+                        send_outbox(
+                            f"⚠️ Cart-build cron missed; inline self-heal also failed: {detail}. "
+                            f"{instacart_due_count} Instacart item(s) due. "
+                            f"Reorder nudge will use legacy framing.",
+                            f"{SOURCE_TAG}:self-heal-failed",
+                        )
+                    except Exception:
+                        print(f"[{datetime.now().isoformat()}] "
+                              f"failed to send self-heal-failed alert")
+                # Reload status regardless — cart-build may have partially run
+                # and written an ERROR or partial-ok status file.
+                cart_status = load_recent_cart_status()
+            missed_alert = cart_build_missed_fire(cart_status, instacart_due_count)
+            if missed_alert:
+                try:
+                    send_outbox(missed_alert, f"{SOURCE_TAG}:cart-build-missed-fire")
+                except Exception:
+                    print(f"[{datetime.now().isoformat()}] "
+                          f"failed to send cart-build-missed-fire alert")
             body = compose(new_due, cart_status)
             if not body.strip():
                 print(f"[{datetime.now().isoformat()}] composed empty body, skipping")

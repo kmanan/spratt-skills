@@ -34,11 +34,13 @@ The LLM writes trip data directly to SQLite through a CLI (`trip-db.py add-fligh
 
 **Setup automation:** Creating a trip automatically texts the household manager asking "solo or group?" A solo reply triggers `setup-solo` (resolves the traveler from contacts, sets their phone as the notification recipient). A group reply triggers adding travelers + `find-group-chat` (scans recent iMessage chats to discover the group GUID). No manual GUID lookups.
 
+**Watchers — additive recipients.** Two kinds of people exist on a trip: **travelers** (the people actually flying — drive primary routing) and **watchers** (people who want a copy of flight events without traveling). A parent at home tracking their kid's flight, a partner CC'd on a business trip's status. Watchers are stored as `travelers` rows with `role='watcher'`, resolved from `contacts.sqlite` by name (or explicit `--phone` override), and excluded from `update_travelers_display` so the trip's primary routing is untouched. Adding a watcher is additive — `add-watcher --trip <id> --name Manan` adds one `travelers` row and changes nothing else. When the flight monitor sends a notification, it queues one outbox row per watcher in addition to the primary recipient (source tag `flight:<num>:watcher`). Watchers are nullable — every trip without one continues to work exactly as before.
+
 **Why it exists:** Family travel has dozens of moving parts — flights, hotels, restaurants, Uber links, group chat notifications — spread across confirmation emails and text threads. Without structure, details get lost and nobody gets reminded. The trip manager gives the LLM a single database to write to, and deterministic scripts handle all the downstream notification scheduling and flight tracking setup.
 
 | | |
 |---|---|
-| **What you get** | trip-db.py (CLI with 13 subcommands including `setup-solo` and `find-group-chat`), trip-outbox-gen.py, trip-status.py, SQLite schema (5 tables) |
+| **What you get** | trip-db.py (CLI with 14 subcommands including `setup-solo`, `find-group-chat`, and `add-watcher`), trip-outbox-gen.py, trip-status.py, SQLite schema (5 tables) |
 | **Dependencies** | Python 3, SQLite, Outbox (above), contacts.sqlite (for name→phone resolution) |
 | **Schedule** | N/A — CLI tools invoked on demand by the LLM or by email scanning cron. |
 | **macOS-specific** | No (all scripts are standalone CLI tools) |
@@ -47,6 +49,8 @@ The LLM writes trip data directly to SQLite through a CLI (`trip-db.py add-fligh
 ### 3. [Flight Monitor](./flight-monitor/) — Real-Time Flight Tracking Daemon
 
 A persistent daemon that polls FlightAware AeroAPI, detects events (landing, delay, gate change, diversion), and sends notifications through the outbox. Adaptive polling — 3 minutes during active window, 30 minutes when idle. No LLM in the polling loop.
+
+**Watcher fanout.** After every event, the monitor queues one outbox row to the trip's primary recipient (group chat for group trips, traveler's phone for solo) and then one additional row per watcher (`travelers` rows with `role='watcher'`, see Trip Manager above). The primary delivery is unchanged whether watchers exist or not; the fanout block is wrapped so any per-watcher failure (missing phone, outbox enqueue error, DB query failure) surfaces as a `system_alert` to the household manager rather than dying silently. Dedup skips watchers whose phone equals the primary recipient.
 
 **Why it exists:** An LLM-mediated flight cron used browser scraping, couldn't interpret "not found," and self-deleted after "completing" with zero notifications sent. The original implementation used `FlightRadarAPI` — a community scraper of FlightRadar24's public data, not an official API — which returned inconsistent results for valid flights. Migrated to FlightAware AeroAPI for stable, authenticated access.
 

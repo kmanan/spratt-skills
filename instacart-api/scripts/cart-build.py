@@ -120,6 +120,35 @@ def main():
             "staged": staged,
             "errors": errors,
         })
+
+        # No-silent-failures: alert Manan if anything is off, even when the
+        # script "completed". Dry-run mode is excluded — manual tests shouldn't
+        # spam alerts.
+        if not args.dry_run:
+            if len(due) > 0 and len(staged) == 0:
+                outbox_send(
+                    f"❌ Instacart cart-build: {len(due)} items were due but 0 staged successfully. "
+                    f"All failed. First error: {(errors[0].get('reason') if errors else 'unknown')[:200]}",
+                    f"{SOURCE_TAG}:all-failed",
+                )
+            elif errors:
+                first = errors[0]
+                outbox_send(
+                    f"⚠️ Instacart cart-build: {len(staged)}/{len(due)} items staged, "
+                    f"{len(errors)} failed. Example: {first.get('name','?')} → "
+                    f"{(first.get('reason') or '')[:150]}",
+                    f"{SOURCE_TAG}:partial-failed",
+                )
+            # Defensive: catch a misconfigured run where mutations report as
+            # dry-run even though --dry-run wasn't passed.
+            phantom_dry = [s for s in staged if "dry-run" in (s.get("mutation_status") or "")]
+            if phantom_dry:
+                outbox_send(
+                    f"⚠️ Instacart cart-build: {len(phantom_dry)} items report dry-run "
+                    f"status but --dry-run was not passed. Cart may not be actually staged. "
+                    f"Check {STATUS_FILE}.",
+                    f"{SOURCE_TAG}:phantom-dry-run",
+                )
         return 0
     except Exception as e:
         tb = traceback.format_exc()
