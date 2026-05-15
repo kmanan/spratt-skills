@@ -106,7 +106,7 @@ Carrier (Amazon, Instacart) → email
 | | |
 |---|---|
 | **What you get** | `scripts/watch.py` (~200 lines, single file), `scripts/gather-emails.hook.py` (the ~80-line hook function to drop into your mail-scan job), launchd plist example, SKILL.md |
-| **Dependencies** | An existing inbox-scan job that fetches Outlook/Gmail metadata on a schedule (this repo's `email-to-orders`-style skill does this). Home Assistant with a front-door contact sensor (device_class=`door`). Outbox CLI. |
+| **Dependencies** | An existing inbox-scan job that fetches Outlook/Gmail metadata on a schedule (the bundled `gather-emails.hook.py` plugs into one). Home Assistant with a front-door contact sensor (device_class=`door`). Outbox CLI. |
 | **Schedule** | launchd `com.spratt.delivery-watcher`, KeepAlive, polls local SQLite every 30s |
 | **macOS-specific** | launchd plist is macOS-specific; daemon is portable to any host that can run Python 3 + curl Home Assistant. |
 | **Setup time** | ~5 minutes once mail-scan + HA + outbox are already wired |

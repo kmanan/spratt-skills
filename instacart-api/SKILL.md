@@ -15,7 +15,7 @@ CLI-driven replacement for browser cart-building. The CLI rides on the Chrome se
 
 - **The bot builds the cart. Manan places the order on his phone.** The CLI has no `place` / `checkout` action. After cart-build, present a summary; Manan opens the Instacart app and taps "Place Order".
 - **Global hard constraint:** Order placement requires the exact phrase `"place the order"` (case-insensitive). Any equivalent ("yes", "do it", "send it", "go ahead") does NOT trigger anything. This skill never places orders anyway, but the constraint applies to any future wiring.
-- **Cart-build only.** Past-order ingestion stays on the existing nightly scraper cron (`Instacart Order Scraper`). Don't touch it.
+- **Cart-build only.** Past-order ingestion stays on the existing nightly scraper (launchd `com.spratt.instacart-history-scrape`, deterministic Python — see the instacart-orders skill). Don't touch it.
 
 ## Prerequisites
 
@@ -69,7 +69,7 @@ If `logged_in:false`:
 
 ## Workflow — programmatic (called from another skill)
 
-Future callers (`recipe-instacart`, `smart-reorder`, `meal-planner`) will invoke this skill with a structured list:
+Future callers (`recipe-instacart`, `meal-planner`) will invoke this skill with a structured list:
 
 ```json
 {

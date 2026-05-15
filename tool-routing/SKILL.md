@@ -24,7 +24,7 @@ Intent -> tool/skill. Read this before composing a response that involves doing 
 - **Note** -> apple-notes skill.
 - **Weather** -> weather skill.
 - **Grocery/shopping (general)** -> browser tool -> instacart.com. Household auto-reorder runs on its own schedule (Wed/Sat) via the reorder-nudge pipeline.
-- **Order history / past purchases** ("what did we order last week", "when did we last buy X") -> **orders** skill (queries orders.sqlite).
+- **Order history / past purchases** ("what did we order last week", "when did we last buy X") -> **instacart-orders** skill (queries the printing-press CLI's local `instacart.db`).
 - **Plan meals / weekly menu / shopping list** -> **meal-planner** skill (feeds into Instacart).
 - **Save a recipe / cook from a saved recipe** -> **recipe-instacart** skill (handles URL extraction, recipes.sqlite, and Instacart cart staging).
 - **Save a place / recall a saved place** ("save this restaurant", "where was that bar in Capitol Hill") -> **places** skill.

@@ -68,23 +68,23 @@ The job-to-be-done: figure out what we're about to run out of, pre-stage those i
 
 **The CLI — order tracking + cart building.** [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) is the single source of truth for both directions. Nightly at 9pm, `history-scrape.py` imports the day's orders into a local SQLite DB with canonical `item_id`, retailer, quantity, and delivered_at — the same identifiers Instacart uses internally. When it's time to reorder, `cart-build.py` calls the CLI's `add <retailer> --item-id <id>` against those same IDs. Direct GraphQL both ways. No browser, no DOM scraping, no fuzzy name matching, no autosuggest roulette.
 
-**The intelligence — cadence + reorder recommendation.** A SQL analyzer reads order history and computes the median days between purchases for every `(item_id, retailer)` pair we've bought at least twice. Items get tagged `due`, `soon`, or `not_due`. Instacart's canonical IDs make this trivial — "QFC organic whole milk, half gallon" is the same row across every order, regardless of how their UI renders it. The same analyzer also reads `orders.sqlite` for Amazon items tracked via [Email-to-Orders](./email-to-orders/); Amazon has no clean API, so cadence on that side uses an LLM (Flash) to merge product-name variants into canonical aliases.
+**The intelligence — cadence + reorder recommendation.** A SQL analyzer reads order history and computes the median days between purchases for every `(item_id, retailer)` pair we've bought at least twice. Items get tagged `due`, `soon`, or `not_due`. Instacart's canonical IDs make this trivial — "QFC organic whole milk, half gallon" is the same row across every order, regardless of how their UI renders it.
 
-**The loop.** Wed + Sat 7:45am PT, `cart-build.py` stages everything that's due. Fifteen minutes later at 8am, `reorder-nudge.py` sends one iMessage covering both retailers — "🛒 Staged in Instacart cart — review & check out" with the checkout URL when staging succeeded, or a "due for reorder" list when it didn't. Amazon items always appear under "📦 buy manually" since Amazon has no cart API. A `reorder_notifications` table tracks last-notified state so the same item doesn't re-announce until it's actually purchased again.
+**The loop.** Wed + Sat 7:45am PT, `cart-build.py` stages everything that's due. Fifteen minutes later at 8am, `reorder-nudge.py` sends one iMessage — "🛒 Staged in Instacart cart — review & check out" with the checkout URL when staging succeeded, or a "due for reorder" list when it didn't. A `reorder_notifications` table tracks last-notified state so the same item doesn't re-announce until it's actually purchased again.
 
-**Why it exists.** The first version was an LLM clicking "Add" in a browser. Eleven of fourteen items would be wrong on a typical run — Instacart's autosuggest matching "organic milk" with whatever was being promoted that morning, in the wrong unit, at the wrong store. Moving to canonical item IDs from the CLI took accuracy to 100% and made the loop deterministic. The LLM is now only involved in one place: deciding whether two Amazon product names refer to the same thing.
+**Why it exists.** The first version was an LLM clicking "Add" in a browser. Eleven of fourteen items would be wrong on a typical run — Instacart's autosuggest matching "organic milk" with whatever was being promoted that morning, in the wrong unit, at the wrong store. Moving to canonical item IDs from the CLI took accuracy to 100% and made the loop deterministic. No LLM in the loop anywhere — the cadence analyzer, the CLI calls, and the message composition are all pure code.
 
 **The boundary.** Spratt builds the cart. We place the order. The CLI has no `place` or `checkout` action and never will — that's an intentional product line, not a missing feature.
 
 | | |
 |---|---|
-| **What you get** | `history-scrape.py` (nightly Apollo-cache import via the CLI's bundled `docs/extract-one.js`), `cadence.py` (Instacart-side reorder analysis on canonical item IDs), `purchase-cadence.py` (Amazon-side cadence over `orders.sqlite`), `item-classify.py` (Flash-based product-alias merger for the Amazon side), `cart-build.py` (deterministic cart staging via `--item-id`), `reorder-nudge.py` (one cart-status-aware iMessage covering both retailers), SQLite schemas (`item_aliases`, `reorder_notifications`), SKILL.md files for both `instacart-orders` and `instacart-api`, three launchd plist examples |
-| **Dependencies** | [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) (Go binary by mvanhorn, ships `docs/extract-one.js`), an active Instacart session (`auth login` or `auth paste`), [Outbox](./outbox/) for message delivery, [Email-to-Orders](./email-to-orders/) for the Amazon-side cadence |
+| **What you get** | `history-scrape.py` (nightly Apollo-cache import via the CLI's bundled `docs/extract-one.js`), `cadence.py` (Instacart-side reorder analysis on canonical item IDs), `cart-build.py` (deterministic cart staging via `--item-id`), `reorder-nudge.py` (cart-status-aware iMessage with checkout URL), SQLite schema (`reorder_notifications` for dedup), SKILL.md files for both `instacart-orders` and `instacart-api`, three launchd plist examples |
+| **Dependencies** | [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) (Go binary by mvanhorn, ships `docs/extract-one.js`), an active Instacart session (`auth login` or `auth paste`), [Outbox](./outbox/) for message delivery |
 | **Schedule** | `com.spratt.instacart-history-scrape` nightly 9pm PT. `com.spratt.instacart-cart-build` Wed + Sat 7:45am PT. `com.spratt.reorder-nudge` Wed + Sat 8am PT (15 min later, so the message can describe what actually staged). |
 | **macOS-specific** | launchd plists; underlying scripts run anywhere with cron/systemd. |
 | **Setup time** | ~20 minutes (`instacart-pp-cli auth login` once, drop three plists, copy two SKILL.mds) |
 
-> **Heritage.** The cart-build half traces back to the [instacart-skill](https://clawhub.com/skills/instacart-skill) by **bigdaddyluke** on ClawHub — an LLM-driven browser approach we forked in April 2026 and retired on 2026-05-13 once the CLI replacement hit 100% accuracy. The cadence/reorder concept survives as `cadence.py` (Instacart) and `purchase-cadence.py` (Amazon). The CLI itself is by **mvanhorn**.
+> **Heritage.** The cart-build half traces back to the [instacart-skill](https://clawhub.com/skills/instacart-skill) by **bigdaddyluke** on ClawHub — an LLM-driven browser approach we forked in April 2026 and retired on 2026-05-13 once the CLI replacement hit 100% accuracy. The cadence/reorder concept survives as `cadence.py`. The CLI itself is by **mvanhorn**.
 
 ### 5. [Discovery Butler](./discovery-butler/) — Casual Coffee / Quick-Bite Nudges
 
@@ -114,21 +114,7 @@ Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft 
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
-### 7. [Email-to-Orders](./email-to-orders/) — Order & Shipment Tracking from Email
-
-An email scanning cron extracts grocery/shopping order details from email confirmations and inserts them into SQLite. Supports Amazon Fresh, Whole Foods, DoorDash, and more. (Instacart is handled separately by the [Instacart](./instacart-orders/) pipeline above — `order-ingest.py` rejects `--source instacart`.) Also tracks shipping status — when a tracking number or delivery update arrives by email, it's stored on the order and the household gets notified for significant events (out for delivery, delivered).
-
-**Why it exists:** "Did we already buy cilantro this week?" and "Where's that Amazon package?" are real questions in a household. The orders database makes them queryable — search by item name, check delivery status, all from one place.
-
-| | |
-|---|---|
-| **What you get** | order-ingest.py (CLI with insert, update-items, update-tracking), SQLite schema with tracking columns, email scan cron prompt template |
-| **Dependencies** | Python 3, SQLite, an email scanning setup (Gmail via gog CLI, Outlook via Microsoft Graph, or any IMAP) |
-| **Schedule** | Cron, 3x/day. Scans emails from the last 8 hours. |
-| **macOS-specific** | No |
-| **Setup time** | ~10 minutes |
-
-### 8. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
+### 7. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
 
 A SQLite database for places you want to remember — restaurants, bars, activities, attractions. Share an Instagram post, Google Maps link, Yelp page, or just say "remember that Thai place on Queen West" and it gets saved with category, cuisine, location, tags, and notes. Query by vibe ("date night spots"), location, cuisine, or who saved it. Track visits and ratings.
 
@@ -142,7 +128,7 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes |
 
-### 9. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
+### 8. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
 
 When you set a destination in your Tesla, this daemon detects it via Home Assistant's WebSocket `subscribe_trigger` and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know. Every category (grocery, daycare, pharmacy, medical, home, work, restaurant) runs through Haiku with a category-specific prompt so unrelated todos don't get dumped into the message. Now includes full instructions for **creating destination-aware reminders** — recurring (weekly day-specific), one-time, and permanent — with rules for how the temporal gate and LLM filter interact so reminders fire on the right day and for the right destination.
 
@@ -156,7 +142,7 @@ When you set a destination in your Tesla, this daemon detects it via Home Assist
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~10 minutes (after Outbox is set up). See [destination-aware/README.md](./destination-aware/README.md) for deployment gotchas. |
 
-### 10. [Delivery Watcher](./delivery-watcher/) — On-Porch Package Alerts
+### 9. [Delivery Watcher](./delivery-watcher/) — On-Porch Package Alerts
 
 KeepAlive daemon that texts both principals when an Amazon or Instacart package is **delivered** and the front-door contact sensor hasn't changed state in the 5 minutes since. The trigger is a sender+subject hook inside the existing email-scan job (no LLM, no body parsing, no mailbox polling in this daemon) that writes a row into `delivery_signals.sqlite`; the daemon polls that local table every 30s. The Ring door sensor in Home Assistant is the "did you already grab it" gate. No camera, no vision, no OCR — the carrier already tells us *which* order arrived.
 
@@ -165,12 +151,12 @@ KeepAlive daemon that texts both principals when an Amazon or Instacart package 
 | | |
 |---|---|
 | **What you get** | `scripts/watch.py` (single-file daemon — polls `delivery_signals.sqlite`, queries HA, writes outbox), `scripts/gather-emails.hook.py` (drop-in hook for your existing inbox-scan job), SKILL.md, launchd plist example |
-| **Dependencies** | Any existing inbox-scan job that fetches Outlook/Gmail metadata on a schedule (this repo's email-to-orders is one such), Home Assistant with a door contact sensor (`device_class=door`), Outbox CLI |
+| **Dependencies** | Any existing inbox-scan job that fetches Outlook/Gmail metadata on a schedule (the bundled `gather-emails.hook.py` plugs into one), Home Assistant with a door contact sensor (`device_class=door`), Outbox CLI |
 | **Schedule** | launchd `com.spratt.delivery-watcher`, KeepAlive, 30s poll loop. First-run backfill silently marks existing delivered rows as already-notified so the daemon doesn't spam on startup. |
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~5 minutes once email-scan + HA + outbox are wired |
 
-### 11. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
+### 10. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
 
 Merged skill that tracks both **"use it or lose it" credit card benefits** (monthly credits, quarterly categories, semi-annual windows) and **per-purchase reward optimization** ("which card for groceries?"). A weekly cron checks expiring benefits and notifies each cardholder with a tiered-brevity format — urgent and this-period items show full detail, while 30+ day items collapse into a single summary line to keep the message scannable. A monthly LLM-powered refresh searches the web for benefit and reward rate changes. Interactive queries recommend the optimal card per spending category with cap awareness and network acceptance warnings (Amex fallbacks).
 
@@ -184,7 +170,7 @@ Merged skill that tracks both **"use it or lose it" credit card benefits** (mont
 | **macOS-specific** | Apple Reminders via remindctl (optional — remove reminder creation for Linux) |
 | **Setup time** | ~10 minutes (after Outbox is set up) |
 
-### 12. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
+### 11. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
 
 Weekly meal planning that reads from your recipe database, checks pantry inventory, and generates shopping lists that feed directly into the [Instacart](./instacart-api/) pipeline. Handles dietary restrictions, household coordination (adults vs kids), batch cooking, and budget tracking. Based on the [meal-planner](https://clawhub.com/skills/meal-planner) skill from ClawHub (by clawic), adapted to use SQLite-backed recipes and the Instacart CLI cart-builder instead of static lists.
 
@@ -193,12 +179,12 @@ Weekly meal planning that reads from your recipe database, checks pantry invento
 | | |
 |---|---|
 | **What you get** | SKILL.md (planning instructions integrated with recipes.sqlite + Instacart pipeline), setup.md, shopping-guide.md, meal-prep.md, budget-tips.md, memory-template.md |
-| **Dependencies** | recipes.sqlite (from recipe-instacart skill), orders.sqlite + instacart.db (for purchase history), [Instacart](./instacart-api/) (for cart building) |
+| **Dependencies** | recipes.sqlite (from recipe-instacart skill), instacart.db (for purchase history), [Instacart](./instacart-api/) (for cart building) |
 | **Schedule** | N/A — interactive skill, invoked on demand when user wants to plan meals. |
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes + first-use household onboarding conversation |
 
-### 13. [Apple Reminders](./apple-reminders/) — Full Reminders Management + Recurring Support
+### 12. [Apple Reminders](./apple-reminders/) — Full Reminders Management + Recurring Support
 
 Full Apple Reminders management via the `remindctl` CLI (view, add, edit, complete, delete, list routing) plus a compiled Swift binary for recurring reminders via EventKit. The `remindctl` CLI doesn't support recurrence natively, so the EventKit binary fills that gap.
 
@@ -212,7 +198,7 @@ Full Apple Reminders management via the `remindctl` CLI (view, add, edit, comple
 | **macOS-specific** | Yes (EventKit is Apple-only) |
 | **Setup time** | ~2 minutes (compile + grant permissions) |
 
-### 14. [Email PDF Attachment](./email-pdf-attachment/) — Native PDF Extraction from Email
+### 13. [Email PDF Attachment](./email-pdf-attachment/) — Native PDF Extraction from Email
 
 Skill instructions for finding Outlook/Gmail emails with PDF attachments, downloading them to an OpenClaw-allowed media path, and reading them through OpenClaw's native PDF capability. The scheduled Spratt email scan uses the same principle: PDF attachments are processed through OpenClaw's bundled `document-extract` PDF extractor before LLM structured extraction.
 
@@ -226,7 +212,7 @@ Skill instructions for finding Outlook/Gmail emails with PDF attachments, downlo
 | **macOS-specific** | No for extraction; downstream actions may use macOS Reminders/Calendar depending on the workflow |
 | **Setup time** | ~2 minutes if email auth is already configured |
 
-### 15. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
+### 14. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
 
 A routing table that maps user intents to the correct tool or skill. Covers messaging (live `message` vs scheduled `outbox`), productivity tools, web/browser, trips, email attachments, the "what are our plans?" multi-source check, forwarded-email semantics, and the cron-vs-outbox hard boundary. Also includes TaskFlow guidance for multi-step interactive workflows (trip planning, Instacart cart building, Resy bookings) that span multiple turns and need durable state tracking.
 
@@ -272,9 +258,9 @@ Human → LLM → places.sqlite (save place from URL or description)
 
 Email → email scan cron (Flash triage → extract)
                     ↓
-              order-ingest.py → orders.sqlite (metadata, items, tracking)
               trip-db.py → trips.sqlite
               outlook-calendar.sh → Outlook calendar (with attendees + notes)
+              delivery_signals.sqlite (handoff to delivery-watcher)
 
               launchd com.spratt.instacart-history-scrape (nightly 9pm)
                     ↓
@@ -299,12 +285,10 @@ Email → email scan cron (Flash triage → extract)
 
               launchd com.spratt.reorder-nudge (Wed + Sat 8am, 15 min after cart-build)
                     ↓
-              fetch Amazon cadence (purchase-cadence.py → orders.sqlite, Flash item-classify)
               fetch Instacart cadence (cadence.py → instacart.db, canonical item_id join)
                     ↓
               if cart-build status ≤45 min old: "🛒 Staged in Instacart cart — review & checkout"
               else: "🛒 Instacart — due for reorder" (manual)
-              + "📦 Amazon — buy manually"
                     ↓
               outbox.sqlite → sender.py → iMessage
 
@@ -447,7 +431,6 @@ columns.
 - `outbox/scripts/outbox.py` → `SCHEMA` covers the `messages` table
 - `trip-manager/scripts/trip-db.py` → `TRIPS_SCHEMA` covers 5 tables
 - `card-wallet/scripts/card-wallet-check.py` → `CARDS_SCHEMA` covers 7 tables
-- `smart-reorder/scripts/order-ingest.py` → `ORDERS_SCHEMA` covers 2 tables
 
 Verified by applying each source schema to a fresh empty DB and comparing
 column-by-column against the live DB.
@@ -501,7 +484,7 @@ exist because an LLM was previously doing that job and doing it badly.
 
 Several components were built on top of skills from the [ClawHub](https://clawhub.com) marketplace:
 
-- **Instacart** rides on [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) by **mvanhorn** — a Go CLI that talks directly to Instacart's GraphQL endpoint. The CLI also ships `docs/extract-one.js`, a one-shot Apollo-cache reader for order history (the one operation Instacart's GraphQL doesn't expose). Our nightly history scraper wraps that bundled extractor with OpenClaw browser driving + per-order durable import; the Wed/Sat cart-build calls `instacart-pp-cli add --item-id` against the canonical IDs the import captured. The cart-builder itself traces back to the [instacart-skill](https://clawhub.com/skills/instacart-skill) by **bigdaddyluke** on ClawHub, an LLM-driven browser approach we forked in April 2026 and retired on 2026-05-13 when the CLI replacement hit 100% accuracy. The cadence/reorder concept survives as `instacart-orders/scripts/cadence.py` (Instacart, canonical IDs) and `smart-reorder/scripts/purchase-cadence.py` (Amazon, LLM-classified aliases).
+- **Instacart** rides on [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) by **mvanhorn** — a Go CLI that talks directly to Instacart's GraphQL endpoint. The CLI also ships `docs/extract-one.js`, a one-shot Apollo-cache reader for order history (the one operation Instacart's GraphQL doesn't expose). Our nightly history scraper wraps that bundled extractor with OpenClaw browser driving + per-order durable import; the Wed/Sat cart-build calls `instacart-pp-cli add --item-id` against the canonical IDs the import captured. The cart-builder itself traces back to the [instacart-skill](https://clawhub.com/skills/instacart-skill) by **bigdaddyluke** on ClawHub, an LLM-driven browser approach we forked in April 2026 and retired on 2026-05-13 when the CLI replacement hit 100% accuracy. The cadence/reorder concept survives as `instacart-orders/scripts/cadence.py` against the printing-press CLI's local DB.
 - **Card Wallet** merges our card-perks tracker with the [card-optimizer](https://clawhub.com/skills/card-optimizer) by scottfo. We unified the data store into SQLite (replacing the JSON file), added multi-holder support, and integrated quarterly management.
 - **Meal Planner** is based on the [meal-planner](https://clawhub.com/skills/meal-planner) by clawic. We rewired it to read from recipes.sqlite instead of markdown files and feed shopping lists into the Instacart CLI pipeline instead of generating static lists.
 
@@ -555,12 +538,7 @@ cd ../flight-monitor
 # Set FLIGHTAWARE_API_KEY in env.sh
 # Install launchd plist (see flight-monitor/README.md)
 
-# 4. Add Email-to-Orders (now with shipment tracking)
-cd ../email-to-orders
-cat schemas/orders.sql | sqlite3 ~/.config/spratt/db/orders.sqlite
-# Add the email scan cron prompt to your OpenClaw cron jobs
-
-# 5. Add Instacart (order tracking + reorder intelligence + auto-staged carts)
+# 4. Add Instacart (order tracking + reorder intelligence + auto-staged carts)
 # Install instacart-pp-cli from https://github.com/mvanhorn/printing-press-library
 # Authenticate: `instacart-pp-cli auth login` (Chrome must be quit), or
 #               `instacart-pp-cli auth paste` (paste Cookie header from DevTools).
@@ -569,9 +547,7 @@ cat schemas/orders.sql | sqlite3 ~/.config/spratt/db/orders.sqlite
 #   instacart-orders/scripts/history-scrape.py  (nightly Apollo-cache import)
 #   instacart-orders/scripts/cadence.py         (Instacart-side reorder analysis)
 #   instacart-api/scripts/cart-build.py         (deterministic cart staging)
-#   smart-reorder/scripts/purchase-cadence.py   (Amazon-side cadence)
-#   smart-reorder/scripts/item-classify.py      (Flash-based product-alias merger)
-#   smart-reorder/scripts/reorder-nudge.py      (one iMessage covering both retailers)
+#   instacart-orders/scripts/reorder-nudge.py   (Wed/Sat iMessage with checkout URL)
 #
 # Install three launchd plists from shared/launchd/:
 #   com.spratt.instacart-history-scrape.plist.example   (nightly 9pm PT)
@@ -584,7 +560,7 @@ cat schemas/orders.sql | sqlite3 ~/.config/spratt/db/orders.sqlite
 #
 # First-run backfill: `python3 history-scrape.py --backfill --max-orders 250`
 
-# 6. Add Discovery Butler (casual coffee / quick-bite nudges)
+# 5. Add Discovery Butler (casual coffee / quick-bite nudges)
 cd ../discovery-butler
 # Install wanderlust-goat-pp-cli from printing-press-library; export GOOGLE_PLACES_API_KEY.
 # Edit MANAN_PHONE / HARSHITA_PHONE + HA entity ids at the top of scripts/nudge.py.
@@ -593,22 +569,22 @@ cd ../discovery-butler
 # Install shared/launchd/com.spratt.discovery-butler.plist.example (daily 2pm local).
 # Copy SKILL.md to your OpenClaw skills directory.
 
-# 7. Add Places
+# 6. Add Places
 cd ../places
 bash examples/setup.sh
 # Copy SKILL.md to your OpenClaw skills directory
 
-# 8. Add Destination-Aware Reminders
+# 7. Add Destination-Aware Reminders
 cd ../destination-aware
 # Configure HA_URL and HA_TOKEN in ~/.config/home-assistant/config.json
 # Set GOOGLE_PLACES_API_KEY for goplaces
 # Install launchd plist (see shared/launchd/)
 
-# 9. Add Delivery Watcher (on-porch package alerts)
+# 8. Add Delivery Watcher (on-porch package alerts)
 cd ../delivery-watcher
 # Requires an email-scan job that records to delivery_signals.sqlite via
-# the gather-emails.hook.py (from email-to-orders, step 4) + HA contact
-# sensor on the front door + Outbox.
+# the bundled gather-emails.hook.py + HA contact sensor on the front door
+# + Outbox.
 # Find your door entity:
 #   curl -H "Authorization: Bearer $HA_TOKEN" $HA_URL/api/states \
 #     | jq -r '.[] | select(.attributes.device_class=="door") | .entity_id'
@@ -618,17 +594,17 @@ cd ../delivery-watcher
 # First run silently backfills existing delivery signals — no spam on startup.
 # Copy SKILL.md to your OpenClaw skills directory.
 
-# 10. Add Card Wallet (benefits + purchase optimizer)
+# 9. Add Card Wallet (benefits + purchase optimizer)
 cd ../card-wallet
 cat schemas/cards.sql | sqlite3 ~/.config/spratt/db/cards.sqlite
 # Seed your cards, benefits, and reward rates
 # Configure HOLDER_RECIPIENTS in card-wallet-check.py
 # Add Saturday + monthly + quarterly cron jobs to OpenClaw
 
-# 11. Add Meal Planner
+# 10. Add Meal Planner
 cd ../meal-planner
 # Copy SKILL.md + reference docs to your OpenClaw skills directory
-# Requires recipes.sqlite (from recipe-instacart skill) and Instacart (step 5)
+# Requires recipes.sqlite (from recipe-instacart skill) and Instacart (step 4)
 # First use triggers household onboarding conversation
 ```
 

@@ -91,6 +91,7 @@ and emits an outbox alert on uncaught failure.
 | Purchase cadence: `purchase-cadence.py` against `orders.sqlite` for both Amazon and Instacart | `purchase-cadence.py` for Amazon only; `instacart/cadence.py` for Instacart |
 | Cart-build via browser autosuggest (`reorder-cart-build.py`) | `cart-build.py` via CLI `add --item-id` (canonical IDs) |
 
-The `orders.sqlite` rows that were already there stay there — they
-power the `orders` skill's interactive Q&A and the Amazon side of the
-reorder nudge. They're just no longer the source of truth for Instacart.
+The historic `orders.sqlite` rows stay where they are; nothing actively
+queries them anymore. The only `orders.sqlite` table still in use is
+`reorder_notifications`, which `reorder-nudge.py` reads + writes to dedup
+Wed/Sat nudges across runs.
