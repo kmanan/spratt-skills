@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 """
-Purchase cadence analysis — reads orders.sqlite to find items due for reorder.
+Purchase cadence analysis — reads orders.sqlite (Amazon + other non-Instacart
+sources) to find items due for reorder.
+
+Originally based on the smart-replenishment idea in the `instacart-skill` by
+bigdaddyluke on ClawHub (https://clawhub.com/skills/instacart-skill).
+Reimplemented as a SQL-backed analyzer over orders.sqlite (instead of an
+LLM-driven cart builder) and refactored to feed Spratt's deterministic
+cart-build pipeline.
 
 Calculates median days between purchases per item. Items purchased 2+ times
 with days_since_last >= median_cadence are flagged as due.
 
+NOTE: As of 2026-05-14, Instacart history is no longer in orders.sqlite —
+it lives in `~/Library/Application Support/instacart/instacart.db` (owned by
+`instacart-pp-cli`). Use the Instacart-side cadence tool
+(`infrastructure/instacart/cadence.py`) for Instacart cadence, and this
+script for Amazon and other sources.
+
 Usage:
-    purchase-cadence.py [--store qfc] [--min-purchases 2] [--format json|text]
+    purchase-cadence.py [--store qfc] [--sources amazon] [--min-purchases 2] [--format json|text]
 """
 
 import argparse
@@ -61,15 +74,15 @@ def load_aliases(db_path):
 def get_item_history(db_path, store=None, sources=None):
     """Extract items with their order dates from the DB.
 
-    sources: list of order source values to include. Defaults to ['instacart']
-    to preserve original single-source behavior for existing callers.
+    sources: list of order source values to include. Defaults to ['amazon']
+    since Instacart history is now in instacart.db (see module docstring).
     """
     require_db_file(db_path, "orders")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
     if not sources:
-        sources = ["instacart"]
+        sources = ["amazon"]
 
     placeholders = ",".join("?" for _ in sources)
     query = f"""
@@ -177,8 +190,8 @@ def analyze(db_path, store=None, min_purchases=2, sources=None):
 def main():
     parser = argparse.ArgumentParser(description="Analyze purchase cadence from orders.sqlite")
     parser.add_argument("--store", default=None, help="Filter by store (e.g. qfc, costco)")
-    parser.add_argument("--sources", default="instacart",
-                        help="Comma-separated order sources to include (default: instacart)")
+    parser.add_argument("--sources", default="amazon",
+                        help="Comma-separated order sources to include (default: amazon — Instacart history is in instacart.db)")
     parser.add_argument("--min-purchases", type=int, default=2, help="Minimum purchases to qualify (default: 2)")
     parser.add_argument("--format", choices=["json", "text"], default="text", help="Output format")
     parser.add_argument("--due-only", action="store_true", help="Only show due and soon items")

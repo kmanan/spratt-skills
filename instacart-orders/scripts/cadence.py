@@ -2,6 +2,12 @@
 """
 Instacart purchase cadence — reads instacart-pp-cli's SQLite history DB.
 
+Originally based on the smart-replenishment idea in the `instacart-skill` by
+bigdaddyluke on ClawHub (https://clawhub.com/skills/instacart-skill). His
+skill was an LLM-driven browser cart-builder; this is the SQL-backed
+descendant that runs over canonical Instacart item_ids supplied by
+mvanhorn's `instacart-pp-cli`.
+
 Replaces the Instacart half of purchase-cadence.py (which reads
 orders.sqlite with regex-normalized item names). Groups by canonical
 (item_id, retailer_slug) which is stable across orders, computes median

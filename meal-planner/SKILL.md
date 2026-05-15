@@ -6,6 +6,12 @@ description: Plan meals with weekly menus, shopping lists, batch cooking, budget
 metadata: {"clawdbot":{"emoji":"🍽️","requires":{"bins":[]},"os":["linux","darwin","win32"]}}
 ---
 
+> Based on the [meal-planner](https://clawhub.com/skills/meal-planner) skill by
+> **clawic** on ClawHub. Spratt's contribution: rewired to read recipes from
+> `recipes.sqlite` (instead of static markdown), feeds shopping lists directly
+> into the Instacart API CLI cart-build pipeline, and pulls pantry inventory
+> from the orders database for dedup.
+
 ## Setup
 
 On first use, read `setup.md` for onboarding guidelines. Start helping naturally without technical jargon.
@@ -18,9 +24,9 @@ User wants to plan meals, generate shopping lists, track food budget, organize r
 
 ### Data stores (existing — do NOT create new ones)
 
-- **Recipes:** `~/.config/spratt/recipes/recipes.sqlite` — structured recipes with JSON ingredients, tags, source URLs. Managed by the `recipe-instacart` skill.
-- **Order history:** `~/.config/spratt/orders/orders.sqlite` — past grocery purchases with itemized data. Source of "what do we usually buy."
-- **Purchase cadence:** `python3 ~/.config/spratt/infrastructure/orders/purchase-cadence.py` — analyzes reorder timing from order history.
+- **Recipes:** `~/.config/spratt/db/recipes.sqlite` — structured recipes with JSON ingredients, tags, source URLs. Managed by the `recipe-instacart` skill.
+- **Grocery history:** `~/Library/Application Support/instacart/instacart.db` — canonical Instacart purchase history (orders + order_items, retailer-scoped). Owned by `instacart-pp-cli`'s history-scrape daemon. This is the food-shaped data; `orders.sqlite` is general Amazon (electronics, household goods) and is NOT relevant for meal planning.
+- **Purchase cadence:** `python3 ~/.config/spratt/infrastructure/instacart/cadence.py` — analyzes reorder timing from Instacart history.
 
 ### Meal planner storage (markdown, for plans and preferences)
 
@@ -171,11 +177,16 @@ Proactively ask about inventory updates:
 - When planning: "Checking pantry — last update was X days ago"
 - For staples: track approximate quantities (full, half, low, out)
 
-Check recent purchases to inform inventory:
+Check recent purchases to inform inventory. Grocery history is in
+`instacart.db` — `orders.sqlite` is general Amazon and not food-shaped, so
+ignore it for meal planning:
+
 ```bash
-sqlite3 ~/.config/spratt/orders/orders.sqlite "
-  SELECT items FROM orders WHERE source = 'instacart'
-  ORDER BY order_date DESC LIMIT 1
+sqlite3 "$HOME/Library/Application Support/instacart/instacart.db" "
+  SELECT o.placed_at, o.retailer_slug, oi.name, oi.quantity
+  FROM order_items oi
+  JOIN orders o ON o.order_id = oi.order_id
+  ORDER BY o.placed_at DESC LIMIT 50
 "
 ```
 
@@ -194,7 +205,7 @@ sqlite3 ~/.config/spratt/orders/orders.sqlite "
 This skill ONLY:
 - Manages meal planning in `~/.config/spratt/meal-planner/`
 - Reads recipes from `recipes.sqlite`
-- Reads purchase history from `orders.sqlite`
+- Reads grocery purchase history from `instacart.db`
 - Generates shopping lists for the Instacart pipeline
 
 This skill NEVER:

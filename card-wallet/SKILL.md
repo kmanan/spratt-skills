@@ -5,6 +5,11 @@ description: Track credit card benefits (use-it-or-lose-it credits) and optimize
 
 # Card Wallet
 
+> The purchase-optimizer half merges in the [card-optimizer](https://clawhub.com/skills/card-optimizer)
+> skill by **scottfo** on ClawHub. Spratt's contribution: unified the data store
+> into SQLite (replacing the JSON file), added multi-cardholder support, and
+> integrated quarterly category management with the benefit-expiry tracker.
+
 Two functions in one skill:
 1. **Benefit tracking** — expiring credits, Saturday cron reminders, mark used/skipped
 2. **Purchase optimizer** — "which card for groceries?" based on reward rates, caps, and network acceptance
