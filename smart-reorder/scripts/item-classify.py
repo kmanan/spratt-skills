@@ -43,7 +43,7 @@ def list_unclassified():
     rows = conn.execute("""
         SELECT DISTINCT json_extract(value, '$.name') AS item_name
         FROM orders, json_each(orders.items)
-        WHERE source = 'instacart'
+        WHERE source != 'instacart'
           AND json_extract(value, '$.name') IS NOT NULL
           AND json_extract(value, '$.name') NOT IN (
               SELECT raw_name FROM item_aliases

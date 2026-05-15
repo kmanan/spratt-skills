@@ -34,8 +34,11 @@ STAGE 2: Extract from actionable emails
 Read full body of each ACTIONABLE email and route:
 
 Grocery/food orders:
-- Instacart: ingest with empty items (email won't have item list):
-  order-ingest.py --source instacart --order-id ID --date DATE --items '[]' --total 0
+- Instacart: DO NOT call order-ingest.py — Instacart history is canonical in
+  ~/Library/Application Support/instacart/instacart.db (managed by
+  instacart-pp-cli's history-scrape daemon). order-ingest.py rejects
+  --source instacart. Instacart receipt emails still feed the delivery-watcher
+  via the gather-emails.hook.py signal recorder.
 - All others (Amazon, DoorDash, etc.): extract full item list:
   order-ingest.py --source SOURCE --order-id ID --date DATE --items 'JSON' --total TOTAL --notify
 ```

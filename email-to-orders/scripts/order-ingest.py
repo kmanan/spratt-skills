@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-Deterministic order ingestion — called by email scanning agent or instacart scraper.
-Inserts order into orders.sqlite and optionally notifies via outbox.
+Deterministic order ingestion — called by email scanning agent.
+Inserts order into orders.sqlite (Amazon + other non-grocery sources) and
+optionally notifies via outbox.
+
+Instacart history is NOT handled here. It is canonical in
+~/Library/Application Support/instacart/instacart.db, populated by
+instacart-pp-cli's history-scrape daemon. The email scan classifies
+Instacart emails as skip upstream.
 
 Usage (insert):
-    order-ingest.py --source instacart --order-id ORD-123 --date 2026-04-05 \
+    order-ingest.py --source amazon --order-id ORD-123 --date 2026-04-05 \
         --items '[{"name":"Whole Milk","qty":2,"price":4.99}]' --total 14.97 \
         --email-id MSG-ABC --account outlook \
         [--notify] [--delivery-status "arriving today 3-5pm"]
 
 Usage (update items on existing order):
-    order-ingest.py update-items --source instacart --order-id ORD-123 \
+    order-ingest.py update-items --source amazon --order-id ORD-123 \
         --items '[{"name":"Whole Milk","qty":2,"price":4.99}]' --total 14.97
 
 Usage (update tracking on existing order):
@@ -29,7 +35,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-ORDERS_DB = os.path.expanduser("~/.config/spratt/orders/orders.sqlite")
+ORDERS_DB = os.path.expanduser("~/.config/spratt/db/orders.sqlite")
 OUTBOX_CLI = os.path.expanduser("~/.config/spratt/infrastructure/outbox/outbox.py")
 MANAN = "+1XXXXXXXXXX"  # Replace with your phone number
 
@@ -231,7 +237,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     # Default (no subcommand) = insert (backwards compatible)
-    parser.add_argument("--source", required=False, help="e.g. instacart, amazon, doordash")
+    parser.add_argument("--source", required=False, help="e.g. amazon, doordash")
     parser.add_argument("--order-id", default=None, help="Vendor order ID")
     parser.add_argument("--date", default=None, help="Order date (YYYY-MM-DD or ISO)")
     parser.add_argument("--items", default=None, help="JSON array of items")
@@ -244,7 +250,7 @@ def main():
 
     # update-items subcommand
     update_parser = subparsers.add_parser("update-items", help="Update items on an existing order")
-    update_parser.add_argument("--source", required=True, help="e.g. instacart")
+    update_parser.add_argument("--source", required=True, help="e.g. amazon, doordash")
     update_parser.add_argument("--order-id", required=True, help="Vendor order ID")
     update_parser.add_argument("--items", required=True, help="JSON array of items")
     update_parser.add_argument("--total", type=float, default=None, help="Order total")

@@ -3,12 +3,15 @@
 delivery-watcher
 ================
 
-KeepAlive daemon. Every 30s:
-  1. Polls orders.sqlite for new (source IN amazon,instacart, tracking_status='delivered') rows.
-  2. Records them in deliveries.sqlite for dedup.
-  3. For deliveries where T+5min has passed, checks binary_sensor.front_door_2
-     in Home Assistant. If last_changed >= delivery_ts → assume picked up, silent.
-     Otherwise → outbox text to Manan + Wife (separate messages).
+KeepAlive daemon. Reads delivery_signals.sqlite (populated by email-scan when
+it sees an Instacart "receipt" or Amazon "Delivered:" email). For each signal
+where T+5min has passed since email arrival:
+  - Checks binary_sensor.front_door_2 in Home Assistant.
+  - If last_changed >= arrived_at → assume picked up, silent.
+  - Otherwise → outbox text to Manan + Wife (separate messages).
+
+No mailbox polling here. email-scan is the upstream eye on the mailbox; this
+daemon just reacts to its signals. Local SQLite read every 30s is free.
 
 Observability is iMessage-first: any uncaught failure outboxes an alert to Manan.
 """
@@ -26,29 +29,29 @@ from urllib.error import URLError
 
 # ---------- config ----------
 
-HA_CONFIG_PATH    = Path.home() / ".config/home-assistant/config.json"
-DOOR_ENTITY       = "binary_sensor.front_door_2"
+HA_CONFIG_PATH       = Path.home() / ".config/home-assistant/config.json"
+DOOR_ENTITY          = "binary_sensor.front_door_2"
 
-ORDERS_DB         = Path.home() / ".config/spratt/db/orders.sqlite"
-DELIVERIES_DB     = Path.home() / ".config/spratt/db/deliveries.sqlite"
-OUTBOX_CLI        = Path.home() / ".config/spratt/infrastructure/outbox/outbox.py"
+DELIVERY_SIGNALS_DB  = Path.home() / ".config/spratt/db/delivery_signals.sqlite"
+DELIVERIES_DB        = Path.home() / ".config/spratt/db/deliveries.sqlite"
+OUTBOX_CLI           = Path.home() / ".config/spratt/infrastructure/outbox/outbox.py"
 
-MANAN_PHONE       = "+13157082088"
-HARSHITA_PHONE    = "+13129330988"
+MANAN_PHONE          = "+13157082088"
+HARSHITA_PHONE       = "+13129330988"
 
-GATE_SECONDS      = 5 * 60     # 5 min after delivery before texting
-POLL_SECONDS      = 30
-FIRST_RUN_GRACE   = 60 * 60    # rows older than 1h on first run = silently backfill
+GATE_SECONDS         = 5 * 60
+POLL_SECONDS         = 30
+FIRST_RUN_GRACE      = 60 * 60   # rows older than 1h on first run = silent backfill
 
 # ---------- DB setup ----------
 
-DELIVERIES_SCHEMA = """
-CREATE TABLE IF NOT EXISTS deliveries (
+ALERTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS alerts (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_pk             INTEGER NOT NULL UNIQUE,
+    message_id           TEXT NOT NULL UNIQUE,
     source               TEXT NOT NULL,
-    order_id             TEXT,
-    delivery_ts          INTEGER NOT NULL,
+    subject              TEXT,
+    arrived_at           INTEGER NOT NULL,
     detected_at          INTEGER NOT NULL,
     notified             INTEGER NOT NULL DEFAULT 0,
     skipped              INTEGER NOT NULL DEFAULT 0,
@@ -57,13 +60,13 @@ CREATE TABLE IF NOT EXISTS deliveries (
     body                 TEXT,
     notified_at          INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_pending ON deliveries(notified, delivery_ts);
+CREATE INDEX IF NOT EXISTS idx_pending ON alerts(notified, arrived_at);
 """
 
 def db_init():
     DELIVERIES_DB.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DELIVERIES_DB) as conn:
-        conn.executescript(DELIVERIES_SCHEMA)
+        conn.executescript(ALERTS_SCHEMA)
 
 # ---------- HA ----------
 
@@ -88,67 +91,36 @@ def get_door_last_changed():
     iso = data.get("last_changed")
     if not iso:
         return None
-    # ISO 8601 — fromisoformat handles +00:00; convert 'Z' to +00:00
     return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
-# ---------- orders polling ----------
+# ---------- signal intake ----------
 
-def parse_ts(iso: str) -> int:
-    """Parse ISO 8601 timestamp to unix seconds. Returns 0 on bad input."""
-    if not iso:
-        return 0
-    try:
-        return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
-    except (ValueError, AttributeError):
-        return 0
-
-def poll_new_deliveries():
-    """Returns list of (order_pk, source, order_id, delivery_ts, body) tuples for orders
-    we haven't seen yet."""
-    if not ORDERS_DB.exists():
+def poll_new_signals():
+    """Return signal rows we haven't recorded an alert for yet."""
+    if not DELIVERY_SIGNALS_DB.exists():
         return []
-    with sqlite3.connect(ORDERS_DB) as conn:
+    with sqlite3.connect(DELIVERY_SIGNALS_DB) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
-            SELECT id, source, order_id, store, items, total, tracking_updated_at
-              FROM orders
-             WHERE tracking_status='delivered'
-               AND source IN ('amazon','instacart')
-               AND tracking_updated_at IS NOT NULL
+            SELECT message_id, source, subject, arrived_at
+              FROM delivery_signals
         """).fetchall()
     with sqlite3.connect(DELIVERIES_DB) as conn:
-        seen = {r[0] for r in conn.execute("SELECT order_pk FROM deliveries")}
-    new = []
-    for r in rows:
-        if r["id"] in seen:
-            continue
-        ts = parse_ts(r["tracking_updated_at"])
-        if ts == 0:
-            continue
-        new.append({
-            "order_pk":    r["id"],
-            "source":      r["source"],
-            "order_id":    r["order_id"],
-            "store":       r["store"],
-            "items":       r["items"],
-            "total":       r["total"],
-            "delivery_ts": ts,
-        })
-    return new
+        seen = {r[0] for r in conn.execute("SELECT message_id FROM alerts")}
+    return [dict(r) for r in rows if r["message_id"] not in seen]
 
-def record_delivery(row, first_run_backfill=False):
-    """Insert into deliveries.sqlite. If first_run_backfill, mark notified=1, skipped=1."""
-    body = format_body(row)
+def record_alert(sig, first_run_backfill=False):
+    body = format_body(sig)
     now = int(time.time())
     with sqlite3.connect(DELIVERIES_DB) as conn:
         conn.execute("""
-            INSERT OR IGNORE INTO deliveries
-                (order_pk, source, order_id, delivery_ts, detected_at,
+            INSERT OR IGNORE INTO alerts
+                (message_id, source, subject, arrived_at, detected_at,
                  notified, skipped, skip_reason, body)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            row["order_pk"], row["source"], row["order_id"],
-            row["delivery_ts"], now,
+            sig["message_id"], sig["source"], sig["subject"],
+            sig["arrived_at"], now,
             1 if first_run_backfill else 0,
             1 if first_run_backfill else 0,
             "first-run backfill" if first_run_backfill else None,
@@ -157,76 +129,65 @@ def record_delivery(row, first_run_backfill=False):
 
 # ---------- body composition ----------
 
-def format_body(row):
-    items = []
-    try:
-        items = json.loads(row["items"]) if row["items"] else []
-    except json.JSONDecodeError:
-        items = []
-    item_count = len(items)
-    total = row.get("total")
-    total_str = f"${total:.2f}" if isinstance(total, (int, float)) else ""
+def parse_amazon_subject(subject):
+    """Pull product name out of e.g. `Delivered: "Live Conscious Magwell..."`."""
+    s = subject
+    if s.startswith("Delivered:"):
+        s = s[len("Delivered:"):].strip()
+    if s.startswith("\"") and "\"" in s[1:]:
+        end = s.index("\"", 1)
+        return s[1:end].rstrip(".")
+    return s.rstrip(".")
 
-    if row["source"] == "instacart":
-        store = row.get("store") or "Instacart"
-        parts = [store, f"{item_count} item{'s' if item_count != 1 else ''}"]
-        if total_str:
-            parts.append(total_str)
-        return f"📦 Instacart delivered — {', '.join(parts)}. Still on porch."
-
-    # amazon
-    if items:
-        first = items[0].get("name", "")[:50].strip().rstrip(".,")
-        more = f" + {item_count - 1} more" if item_count > 1 else ""
-        return f"📦 Amazon delivered: {first}{more}. Still on porch."
-    return "📦 Amazon delivered. Still on porch."
+def format_body(sig):
+    if sig["source"] == "instacart":
+        return "📦 Instacart delivered. Still on porch."
+    if sig["source"] == "amazon":
+        name = parse_amazon_subject(sig.get("subject") or "")
+        if name:
+            return f"📦 Amazon delivered: {name}. Still on porch."
+        return "📦 Amazon delivered. Still on porch."
+    return "📦 Delivery — still on porch."
 
 # ---------- gate + send ----------
 
 def find_due():
-    """Rows where T+GATE_SECONDS has passed and we haven't notified."""
     cutoff = int(time.time()) - GATE_SECONDS
     with sqlite3.connect(DELIVERIES_DB) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute("""
-            SELECT id, order_pk, source, delivery_ts, body
-              FROM deliveries
-             WHERE notified=0 AND delivery_ts <= ?
+            SELECT id, message_id, source, arrived_at, body
+              FROM alerts
+             WHERE notified=0 AND arrived_at <= ?
         """, (cutoff,)).fetchall()
 
-def evaluate_and_send(due_row):
-    """For one due delivery: check door, send or skip, mark."""
-    delivery_ts_utc = datetime.fromtimestamp(due_row["delivery_ts"], tz=timezone.utc)
+def evaluate_and_send(due):
+    arrived_utc = datetime.fromtimestamp(due["arrived_at"], tz=timezone.utc)
     door_changed = get_door_last_changed()
     if door_changed is None:
-        # HA unreachable — defer (don't mark notified, retry next loop)
         return
-    skipped = door_changed >= delivery_ts_utc
-    now = int(time.time())
-    if skipped:
-        mark_done(due_row["id"], skipped=True,
-                  skip_reason=f"door changed at {door_changed.isoformat()} >= delivery",
+    if door_changed >= arrived_utc:
+        mark_done(due["id"], skipped=True,
+                  skip_reason=f"door changed at {door_changed.isoformat()} >= arrived",
                   door_iso=door_changed.isoformat())
         return
-    # send to both
-    body = due_row["body"]
+    body = due["body"]
     ok_a = send_outbox(MANAN_PHONE, body)
     ok_b = send_outbox(HARSHITA_PHONE, body)
     if not (ok_a and ok_b):
-        # leave un-notified so we retry next loop; alert
-        alert_failure(f"outbox send failed: manan={ok_a} wife={ok_b}, order_pk={due_row['order_pk']}")
+        alert_failure(f"outbox send failed: manan={ok_a} wife={ok_b}, msg_id={due['message_id']}")
         return
-    mark_done(due_row["id"], skipped=False, skip_reason=None,
+    mark_done(due["id"], skipped=False, skip_reason=None,
               door_iso=door_changed.isoformat())
 
-def mark_done(delivery_id, skipped, skip_reason, door_iso):
+def mark_done(alert_id, skipped, skip_reason, door_iso):
     with sqlite3.connect(DELIVERIES_DB) as conn:
         conn.execute("""
-            UPDATE deliveries
+            UPDATE alerts
                SET notified=1, skipped=?, skip_reason=?,
                    door_last_changed_at=?, notified_at=?
              WHERE id=?
-        """, (1 if skipped else 0, skip_reason, door_iso, int(time.time()), delivery_id))
+        """, (1 if skipped else 0, skip_reason, door_iso, int(time.time()), alert_id))
 
 def send_outbox(to, body):
     try:
@@ -249,21 +210,17 @@ def alert_failure(reason):
 # ---------- main loop ----------
 
 def first_run_backfill():
-    """On very first run, mark any already-delivered rows that are older than
-    FIRST_RUN_GRACE as backfill (silent). Recent ones still get processed."""
     with sqlite3.connect(DELIVERIES_DB) as conn:
-        already = conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+        already = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
     if already > 0:
-        return  # not first run
+        return
     cutoff = int(time.time()) - FIRST_RUN_GRACE
-    for row in poll_new_deliveries():
-        record_delivery(row, first_run_backfill=row["delivery_ts"] < cutoff)
+    for sig in poll_new_signals():
+        record_alert(sig, first_run_backfill=sig["arrived_at"] < cutoff)
 
 def loop_once():
-    # 1. discover new deliveries
-    for row in poll_new_deliveries():
-        record_delivery(row)
-    # 2. process due ones
+    for sig in poll_new_signals():
+        record_alert(sig)
     for due in find_due():
         evaluate_and_send(due)
 
