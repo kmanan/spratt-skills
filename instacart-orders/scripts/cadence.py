@@ -15,12 +15,36 @@ call `instacart add --item-id`.
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import sys
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from statistics import median
+
+
+def recency_match(days_since, cadence_days):
+    if cadence_days <= 0:
+        return 0.0
+    ratio = days_since / cadence_days
+    if ratio < 0.5:
+        return 0.0
+    if ratio <= 1.5:
+        return 1.0
+    if ratio <= 3.0:
+        return (3.0 - ratio) / 1.5
+    return 0.0
+
+
+def confidence(purchases):
+    return min(1.0, max(0.0, (purchases - 1) / 4))
+
+
+def compute_score(purchases, cadence_days, days_since):
+    return (math.log(purchases + 1)
+            * recency_match(days_since, cadence_days)
+            * confidence(purchases))
 
 HOME = os.path.expanduser("~")
 CLI_DB = f"{HOME}/Library/Application Support/instacart/instacart.db"
@@ -108,6 +132,9 @@ def analyze(db_path, store=None, min_purchases=2):
             status = "not_due"
 
         latest = events[-1]
+        med_qty = median([e[2] for e in events]) or 1
+        score = compute_score(len(unix_dates), cadence, days_since)
+        recency_ratio = round(days_since / cadence, 2) if cadence > 0 else 0.0
         results.append({
             "item": latest[1],
             "canonical_key": item_id,
@@ -116,15 +143,16 @@ def analyze(db_path, store=None, min_purchases=2):
             "days_since": days_since,
             "last_purchased": last_iso,
             "status": status,
+            "score": round(score, 3),
+            "recency_ratio": recency_ratio,
             "retailer_slug": retailer_slug,
             "item_id": item_id,
             "product_id": latest[4],
-            "quantity": latest[2],
+            "quantity": med_qty,
             "quantity_type": latest[3],
         })
 
-    status_order = {"due": 0, "soon": 1, "not_due": 2}
-    results.sort(key=lambda r: (status_order[r["status"]], -r["days_since"]))
+    results.sort(key=lambda r: -r["score"])
     return results
 
 
@@ -139,7 +167,10 @@ def main():
 
     results = analyze(CLI_DB, store=args.store, min_purchases=args.min_purchases)
     if args.due_only:
-        results = [r for r in results if r["status"] in ("due", "soon")]
+        results = [r for r in results
+                   if r["status"] in ("due", "soon")
+                   and r["purchases"] >= 4
+                   and r["recency_ratio"] <= 3]
 
     if args.format == "json":
         print(json.dumps(results, indent=2))
