@@ -79,12 +79,15 @@ Replaces the v1 binary "due today or skip" gate. Cooldown is tracked per-reminde
 
 | Time to due | Cooldown |
 |---|---|
-| Overdue / today / no due date | 0 (every matching trip) |
-| ≤ 7 days | 0 (every matching trip) |
+| No due date | 0 (every matching trip) |
+| Overdue / today / tomorrow | 1 day (max one fire per day per reminder) |
+| 2–7 days out | **None — do not fire** |
 | 8–30 days | 1 day |
 | > 30 days | 7 days |
 
-A reminder created today with a due date 120 days out will fire about 18 times before its due date — once a week until ~30 days out, daily until ~7 days out, then every trip. No more "the reminder went silent for 140 days and reappeared the day before."
+A reminder due 120 days out fires about 18 times in its runway: weekly until ~30 days out, daily until ~7 days out, silent through the 2–7 day band, then daily again from "due tomorrow" through completion. Weekly-recurring reminders (e.g. "Take Sriram's blanket to Bright Horizons" every Monday) fire on the day-before heads-up and the due day only — never on the Tue/Wed/Thu/Fri trips in between.
+
+**Why a silent band 2–7 days out:** weekly recurrence means a reminder's next instance is perpetually within 7 days, so the old "≤ 7d → every trip" rule made weekly-recurring reminders fire on every matching trip forever. Suppressing 2–7 days, then re-enabling at "due tomorrow", matches the user's mental model: "tell me when I'm at the destination on the day it matters." See `destination-aware-v2.md` "Post-launch tuning — 2026-05-15".
 
 ## Creating destination-aware reminders
 

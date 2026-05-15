@@ -264,9 +264,34 @@ def _days_until_due(due_iso):
 
 
 def _tier_cooldown(days):
-    """Seconds of cooldown required since last fire. 0 = no rate limit."""
-    if days is None or days <= 7:
+    """Cooldown in seconds since last fire, or None for 'do not fire'.
+
+    Tiers (updated 2026-05-15 to fix weekly-recurring fire-storm — see
+    destination-aware-v2.md "Post-launch tuning"):
+
+      None              0       no due date — fire every trip
+      < 0  (overdue)    86400   once per day
+      == 0 (today)      86400   once per day
+      == 1 (tomorrow)   86400   once per day — heads-up
+      2..7 days         None    DO NOT FIRE — silent until heads-up window
+      8..30 days        86400   once per day
+      > 30 days         7*86400 once per week
+
+    The pre-fix behavior fired every trip for any reminder due in <=7 days,
+    which made weekly-recurring reminders ("Take blanket to BH" due each
+    Monday) fire on every daycare drop-off Tue/Wed/Thu/Fri/Mon — five+
+    spam fires per weekly cycle. Returning None for the 2..7 day band
+    suppresses all lead-up fires; only the day-before heads-up and day-of
+    fires remain.
+    """
+    if days is None:
         return 0
+    if days < 0:
+        return 86400
+    if days <= 1:
+        return 86400
+    if days <= 7:
+        return None
     if days <= 30:
         return 86400
     return 7 * 86400
@@ -275,10 +300,8 @@ def _tier_cooldown(days):
 def _eligible_titles(items):
     """Reminders passing the lead-time cadence gate.
 
-    Tier behavior:
-      None / overdue / due in <=7d  → every trip (no cooldown)
-      <=30d                          → once per day per reminder
-      >30d                           → once per week per reminder
+    See _tier_cooldown for the tier table. Cooldown=None means the
+    lead-time gate suppresses entirely (don't fire on any trip).
     Recurrence still works because Apple advances dueDate on completion.
 
     Returns list of {id, title, days, prefix}.
@@ -295,6 +318,8 @@ def _eligible_titles(items):
             continue
         days = _days_until_due(r.get("dueDate"))
         cooldown = _tier_cooldown(days)
+        if cooldown is None:
+            continue
         if cooldown > 0:
             last = recent_fires.get(rid)
             if last is not None and (now_utc - last).total_seconds() < cooldown:
