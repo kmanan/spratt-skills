@@ -60,7 +60,7 @@ A persistent daemon that polls FlightAware AeroAPI, detects events (landing, del
 
 ### 4. [Email-to-Orders](./email-to-orders/) — Order & Shipment Tracking from Email
 
-An email scanning cron extracts grocery/shopping order details from email confirmations and inserts them into SQLite. Supports Instacart, Amazon Fresh, Whole Foods, DoorDash, and more. Also tracks shipping status — when a tracking number or delivery update arrives by email, it's stored on the order and the household gets notified for significant events (out for delivery, delivered).
+An email scanning cron extracts grocery/shopping order details from email confirmations and inserts them into SQLite. Supports Amazon Fresh, Whole Foods, DoorDash, and more. (Instacart is handled separately by the [Instacart Orders](./instacart-orders/) CLI pipeline — `order-ingest.py` rejects `--source instacart`.) Also tracks shipping status — when a tracking number or delivery update arrives by email, it's stored on the order and the household gets notified for significant events (out for delivery, delivered).
 
 **Why it exists:** "Did we already buy cilantro this week?" and "Where's that Amazon package?" are real questions in a household. The orders database makes them queryable — search by item name, check delivery status, all from one place.
 

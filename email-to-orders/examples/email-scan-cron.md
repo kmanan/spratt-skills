@@ -7,7 +7,7 @@ Example cron prompt for an email scanning agent that triages recent emails and i
 - Use the `query --after` command for Outlook and `after:` with epoch seconds for Gmail. **Do NOT use `newer_than:` — it silently fails when combined with other operators like `is:unread`.**
 - The 8-hour window provides overlap with a 3x/day scan schedule (e.g., 7:30am, 1:30pm, 6pm).
 - Order deduplication is handled by `order-ingest.py` (skips if `order_id + source` already exists), so re-scanning the same email is harmless.
-- Instacart orders are ingested with empty items — the `instacart-orders` skill fills them in later via browser scraping.
+- Instacart is NOT ingested here — its history is canonical in `instacart.db` via the `instacart-pp-cli` history-scrape daemon (see STAGE 2 below). `order-ingest.py` rejects `--source instacart`.
 
 ## Prompt
 
