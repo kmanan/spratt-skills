@@ -86,7 +86,7 @@ Compose model: edit `GATEWAY_MODEL` / `GATEWAY_FALLBACK`. If you don't use OpenC
 
 ## What's intentionally NOT in v1
 
-- Taste profile from `orders.sqlite` — coffee shops are low-stakes.
+- Taste profile from `instacart.db` / `orders.sqlite` — coffee shops are low-stakes.
 - `table-reservation-goat` integration — these are walk-in suggestions by design.
 - `card-wallet` integration — coffee shops have no meaningful card-credit nudges.
 
@@ -94,4 +94,12 @@ Add later only if the bare version proves too thin.
 
 ## Failure behavior
 
-Every uncaught failure inside the at-home or trip loop fires an outbox alert to `MANAN_PHONE` with the reason — observability lives on the user's phone, not in logs (Spratt is iMessage-first). "No picks returned" also alerts — usually means Google Places quota is exhausted or `GOOGLE_PLACES_API_KEY` rotated.
+Every uncaught failure inside the at-home or trip loop fires an outbox alert to `MANAN_PHONE` with the reason — observability lives on the user's phone, not in logs (Spratt is iMessage-first). "No picks returned" also alerts.
+
+### "No picks" — the env-var trap
+
+The most common cause of "no picks" is not quota exhaustion, it's `GOOGLE_PLACES_API_KEY` being set in your interactive shell (e.g. `~/.zshrc`) but NOT in `shared/env/env.sh`. launchd does not source `~/.zshrc` or `~/.zshenv`, so wanderlust-goat-pp-cli exits with rc=4 and stderr `"Error: GOOGLE_PLACES_API_KEY is not set"` — which `subprocess.run(..., capture_output=True)` swallows, returning the same empty list it would for "no operational coffee shops nearby." Manual `nudge.py --smoke` works, the cron fails.
+
+To diagnose, log `proc.returncode`, `len(proc.stdout)`, and the first line of `proc.stderr` inside `fetch_picks`. The fix is one line: add `export GOOGLE_PLACES_API_KEY="..."` to `shared/env/env.sh`. The plist already sources it via the wrapper pattern (`/bin/zsh -c "source ... && /usr/bin/python3 ..."`).
+
+Other causes (in rough order of frequency): Google Places quota exhausted, `GOOGLE_PLACES_API_KEY` rotated/revoked, network failure, wanderlust-goat-pp-cli not on `PATH` for the launchd job.

@@ -183,14 +183,14 @@ When you set a destination in your Tesla, this daemon detects it via Home Assist
 
 ### 12. [Delivery Watcher](./delivery-watcher/) — On-Porch Package Alerts
 
-KeepAlive daemon that texts both principals when an Amazon or Instacart package is **delivered** and the front-door contact sensor hasn't changed state in the 5 minutes since. Carrier delivery confirmation (parsed by email-scan into `orders.sqlite`) is the trigger; the Ring door sensor in Home Assistant is the "did you already grab it" gate. No camera, no vision, no OCR — the carrier already tells us *which* order arrived.
+KeepAlive daemon that texts both principals when an Amazon or Instacart package is **delivered** and the front-door contact sensor hasn't changed state in the 5 minutes since. The trigger is a sender+subject hook inside the existing email-scan job (no LLM, no body parsing, no mailbox polling in this daemon) that writes a row into `delivery_signals.sqlite`; the daemon polls that local table every 30s. The Ring door sensor in Home Assistant is the "did you already grab it" gate. No camera, no vision, no OCR — the carrier already tells us *which* order arrived.
 
 **Why it exists:** A delivery notification from the Amazon app says "delivered." It doesn't say "...and it's still sitting on your porch in the rain." This skill closes that loop — if you opened the front door within 5 minutes of the delivery, it stays silent. Otherwise both you and your partner get a one-line text so somebody grabs it before the porch pirate or the weather does.
 
 | | |
 |---|---|
-| **What you get** | `scripts/watch.py` (~240 lines, single-file daemon — polls orders.sqlite, queries HA, writes outbox), SKILL.md, launchd plist example |
-| **Dependencies** | `orders.sqlite` populated by an email-scan pipeline (see email-to-orders skill above), Home Assistant with a door contact sensor (`device_class=door`), Outbox CLI |
+| **What you get** | `scripts/watch.py` (single-file daemon — polls `delivery_signals.sqlite`, queries HA, writes outbox), `scripts/gather-emails.hook.py` (drop-in hook for your existing inbox-scan job), SKILL.md, launchd plist example |
+| **Dependencies** | Any existing inbox-scan job that fetches Outlook/Gmail metadata on a schedule (this repo's email-to-orders is one such), Home Assistant with a door contact sensor (`device_class=door`), Outbox CLI |
 | **Schedule** | launchd `com.spratt.delivery-watcher`, KeepAlive, 30s poll loop. First-run backfill silently marks existing delivered rows as already-notified so the daemon doesn't spam on startup. |
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~5 minutes once email-scan + HA + outbox are wired |
@@ -371,11 +371,13 @@ Tesla nav destination set → sensor.maha_tesla_destination changes
                     ↓
               outbox.sqlite → sender.py → "🛒 Heading to QFC — cilantro, milk, paper towels"
 
-email-scan inserts orders.sqlite row: tracking_status='delivered', source IN (amazon,instacart)
+email-scan hook (gather-emails.hook.py) records delivery signals
+              into delivery_signals.sqlite (Amazon "delivered" emails,
+              Instacart "receipt" emails, etc.) — no orders.sqlite write
                     ↓
               delivery-watcher.py daemon (KeepAlive, 30s poll)
                     ↓
-              deliveries.sqlite — record + dedup on order_pk
+              deliveries.sqlite — record + dedup on signal id
                     ↓
               T+5min: GET /api/states/binary_sensor.<front_door>
                     ↓
@@ -550,7 +552,15 @@ cd spratt-skills
 
 # Set up environment
 cp shared/env/env.example.sh shared/env/env.sh
-# Edit env.sh with your API keys
+# Edit env.sh with your API keys.
+#
+# CRITICAL: every launchd plist in this repo sources env.sh via a wrapper
+# (/bin/zsh -c "source .../env.sh && /usr/bin/python3 ...") because launchd
+# does NOT source ~/.zshrc or ~/.zshenv. Any key you export interactively
+# will silently fail under cron unless it's also in env.sh — the wrapped
+# CLI exits nonzero, subprocess.run swallows the stderr, and your script
+# sees "no results" indistinguishable from a legitimate empty response.
+# See discovery-butler/SKILL.md "Failure behavior" for the canonical writeup.
 
 # Create the consolidated database directory
 mkdir -p ~/.config/spratt/db
@@ -623,14 +633,16 @@ cd ../destination-aware
 
 # 11. Add Delivery Watcher (on-porch package alerts)
 cd ../delivery-watcher
-# Requires orders.sqlite (from email-to-orders, step 4) + HA contact sensor on the front door + Outbox.
+# Requires an email-scan job that records to delivery_signals.sqlite via
+# the gather-emails.hook.py (from email-to-orders, step 4) + HA contact
+# sensor on the front door + Outbox.
 # Find your door entity:
 #   curl -H "Authorization: Bearer $HA_TOKEN" $HA_URL/api/states \
 #     | jq -r '.[] | select(.attributes.device_class=="door") | .entity_id'
 # Edit DOOR_ENTITY + MANAN_PHONE + HARSHITA_PHONE at the top of scripts/watch.py.
 # Drop scripts/watch.py into your infrastructure dir.
 # Install shared/launchd/com.spratt.delivery-watcher.plist.example (KeepAlive, 30s poll).
-# First run silently backfills existing delivered rows — no spam on startup.
+# First run silently backfills existing delivery signals — no spam on startup.
 # Copy SKILL.md to your OpenClaw skills directory.
 
 # 12. Add Card Wallet (benefits + purchase optimizer)
