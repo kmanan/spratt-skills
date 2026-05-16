@@ -42,7 +42,7 @@ instacart-pp-cli history stats --json
 The DB exposes canonical Instacart IDs:
 
 - `order_id` — 17–18 digit numeric (the Apollo cache id, not the URL id).
-- `item_id` — format `items_<retailerLocationId>-<legacyProductId>` (use this with `instacart-pp-cli add --item-id ...` to bypass autosuggest).
+- `item_id` — format `items_<retailerLocationId>-<legacyProductId>` (use this with `instacart-pp-cli add --item-id ...` to bypass autosuggest). **Caveat (2026-05-16):** the nightly scraper currently persists RetailerID-prefixed IDs (e.g. `items_42-...` for QFC RetailerID=42) instead of the LocationID-prefixed form Instacart's add-to-cart API now requires (e.g. `items_3092-...` for the QFC store branch serving the saved address). Dry-runs still pass; real mutations get rejected as `notFoundBasketProduct`. The Wed/Sat `cart-build.py` self-heals by re-searching by item name on rejection and retrying with the fresh LocationID-prefixed ID, but ad-hoc `instacart-pp-cli add --item-id` calls do NOT have that fallback — search first or expect rejection on stored historical IDs.
 - `product_id` — numeric, useful for cross-referencing.
 
 ## Ad-hoc re-import (rare)
