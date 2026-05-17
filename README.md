@@ -226,6 +226,21 @@ A routing table that maps user intents to the correct tool or skill. Covers mess
 | **macOS-specific** | No |
 | **Setup time** | ~1 minute (copy to skills directory) |
 
+### 15. [Wanderlust](./wanderlust/) — Walking-Distance Place Discovery
+
+A CLI-driven walking-distance discovery engine that powers two surfaces: (1) the scheduled trip-city daily ping that wakes each active trip's iMessage chat with weather + 3 picks each morning, and (2) ad-hoc coffee-shop recommendations during regular conversation ("coffee shop we can walk to from the Seattle Aquarium" → top picks ranked by walking time and signal across Google Places, Reddit, Wikipedia, and Atlas Obscura).
+
+**Why it exists:** asking the LLM "find me a coffee shop near X" without a tool used to land in `tavily` / `firecrawl` / `web_search`, which return generic listicles instead of a deterministically-ranked walking radius. Wanderlust's `goat` subcommand is deterministic — static keyword tables, walking-time filter, multi-source aggregation — so the LLM doesn't have to think about it. Spratt was skipping it in conversation; this skill's frontmatter description now explicitly routes coffee-shop queries to `goat` before web search.
+
+| | |
+|---|---|
+| **What you get** | SKILL.md (frontmatter description that triggers the router on coffee-shop conversational queries + trip-city digest reference), `scripts/trip-city-digest.py` (the daily launchd job that iterates active trips, geocodes destination, fetches weather, runs `goat`, composes a 4-line message, schedules via outbox with per-trip dedup) |
+| **Dependencies** | [`wanderlust-goat-pp-cli`](https://github.com/mvanhorn/printing-press-library) (`GOOGLE_PLACES_API_KEY` required; `ANTHROPIC_API_KEY` optional, only used by the `near` subcommand for `--llm` criteria match), [`weather-goat-pp-cli`](https://github.com/mvanhorn/printing-press-library) for geocoding + forecast, Spratt's outbox CLI, `trips.sqlite` with `trips.group_chat_guid` populated for trip-city ping delivery |
+| **Conversational scope (today)** | Coffee shops only. Other categories (restaurants, museums, photo spots, walking routes, events) are intentionally NOT yet in conversational scope — they stay on `web_search` / `tavily` / `firecrawl` until quality is validated category-by-category. |
+| **Schedule** | launchd daily for the trip-city digest (skips trips listed in `state/skip-trips.json`). Conversational use is on-demand. Deterministic — `goat` uses static keyword tables, no LLM in the runtime path. |
+| **macOS-specific** | No |
+| **Setup time** | ~5 minutes once `wanderlust-goat-pp-cli` is installed |
+
 ---
 
 ## Architecture
