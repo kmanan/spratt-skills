@@ -476,7 +476,7 @@ Comprehensive audit lives in conversation history. Short version of the rejects 
 
 ## Resolved decisions (2026-05-11)
 
-- **Discovery-butler cron model:** `openai-codex/gpt-5.5` via `openclaw infer model run --gateway --model openai-codex/gpt-5.5`. Same pattern as email-scan — uses Manan's Codex subscription, no per-token Anthropic/Gemini cost. Fallback to Flash. (Phase 4.) Phase 5 food-butler compose step uses the same gateway invocation, same model.
+- **Discovery-butler cron model:** `openai/gpt-5.5` via `openclaw infer model run --gateway --model openai/gpt-5.5`. Same pattern as email-scan — uses Manan's Codex subscription, no per-token Anthropic/Gemini cost. Fallback to Flash. (Phase 4.) Phase 5 food-butler compose step uses the same gateway invocation, same model.
 - **Harshita's iMessage handle for discovery nudges:** `+13129330988` (Wife).
 - **Food-butler reply state:** Inline-everything in the nudge body for v1. The reply matcher is the strict substring check (`"place the order" in reply.lower()`) — see the global hard constraint at the top. Revisit TaskFlow `setWaiting`/`resume` only if reply correctness suffers when replies arrive 30+ min later in a fresh session.
 
@@ -530,7 +530,7 @@ Audited what Manan already has vs. what each CLI needs. Run `<cli> doctor` (or e
 
 | Use | Routing | Key |
 |---|---|---|
-| Discovery-butler one-line compose (Phase 4) | `openclaw infer model run --gateway --model openai-codex/gpt-5.5` | OpenClaw gateway (no per-job key) |
+| Discovery-butler one-line compose (Phase 4) | `openclaw infer model run --gateway --model openai/gpt-5.5` | OpenClaw gateway (no per-job key) |
 | Food-butler one-line compose (Phase 5) | same | same |
 | Card-wallet redemption reasoning (Phase 2) | In-skill, runs in Manan's live session | `ANTHROPIC_API_KEY` ✅ (already used) |
 

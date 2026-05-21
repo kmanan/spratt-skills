@@ -16,7 +16,7 @@ Composition:
   - wanderlust-goat-pp-cli returns ranked picks (deterministic, no LLM).
   - Top pick is dedup'd vs places.sqlite (already-saved spots) and
     today's calendar.
-  - OpenClaw infer gateway (openai-codex/gpt-5.5; Flash fallback) wraps
+  - OpenClaw infer gateway (openai/gpt-5.5; Flash fallback) wraps
     the pick in one casual butler-voice line. Final fallback is a
     deterministic template — never silent.
 
@@ -29,8 +29,10 @@ import os
 import sqlite3
 import subprocess
 import sys
+import unicodedata
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 ROOT = os.path.expanduser("~/.config/spratt")
 DB_DIR = os.path.join(ROOT, "db")
@@ -54,9 +56,22 @@ HA_GEOCODE_ENTITY = {
 HOME_LAT, HOME_LON, HOME_LABEL = 47.674, -122.122, "Redmond, WA"
 STALE_LOCATION_HOURS = 6
 
-GATEWAY_MODEL = "openai-codex/gpt-5.5"
+GATEWAY_MODEL = "openai/gpt-5.5"
 GATEWAY_FALLBACK = "google/gemini-2.5-flash"
 GATEWAY_TIMEOUT_S = 30
+
+# Cron fires twice — 14:00 and 14:15 PT. If the 14:00 run gets no picks, the
+# 14:15 retry covers a transient hiccup. Alert Manan only if both attempts fail.
+MAX_ATTEMPTS = 2
+RECOMMENDATION_COOLDOWN_DAYS = 180
+
+# Explicit hard-blocks. These are normalized before matching, so accents,
+# punctuation, and suffix variants do not let the same place through.
+BLOCKED_PLACE_NAMES = {
+    "kitanda",
+    "kitanda espresso acai",
+    "kitanda espresso acai redmond",
+}
 
 
 def ensure_fires_db():
@@ -71,6 +86,50 @@ def ensure_fires_db():
                 PRIMARY KEY (person, kind, key)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS attempts (
+                person TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                key TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                last_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (person, kind, key)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS recommendations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                key TEXT NOT NULL,
+                place_name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                map_url TEXT,
+                sent_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_recommendations_normalized_sent
+            ON recommendations(normalized_name, sent_at)
+        """)
+
+
+def bump_attempt(person, kind, key):
+    """Increment attempt counter for this dedup key; return new count."""
+    with sqlite3.connect(FIRES_DB) as conn:
+        conn.execute("""
+            INSERT INTO attempts (person, kind, key, count, last_at)
+            VALUES (?, ?, ?, 1, datetime('now'))
+            ON CONFLICT(person, kind, key) DO UPDATE SET
+                count = count + 1,
+                last_at = datetime('now')
+        """, (person, kind, key))
+        conn.commit()
+        row = conn.execute(
+            "SELECT count FROM attempts WHERE person=? AND kind=? AND key=?",
+            (person, kind, key),
+        ).fetchone()
+    return row[0] if row else 1
 
 
 def already_sent(person, kind, key):
@@ -88,6 +147,76 @@ def mark_sent(person, kind, key):
             "INSERT OR IGNORE INTO fires (person, kind, key) VALUES (?, ?, ?)",
             (person, kind, key),
         )
+        conn.commit()
+
+
+def normalize_place_name(name):
+    """Normalize place names for repeat/block matching."""
+    normalized = unicodedata.normalize("NFKD", name or "")
+    ascii_name = normalized.encode("ascii", "ignore").decode("ascii")
+    chars = [c.lower() if c.isalnum() else " " for c in ascii_name]
+    return " ".join("".join(chars).split())
+
+
+def is_blocked_place(name):
+    normalized = normalize_place_name(name)
+    return any(normalized == blocked or normalized.startswith(f"{blocked} ") for blocked in BLOCKED_PLACE_NAMES)
+
+
+def recent_recommendation_names(cooldown_days=RECOMMENDATION_COOLDOWN_DAYS):
+    """Names recently recommended by this job, including pre-table outbox history."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=cooldown_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    names = set()
+    with sqlite3.connect(FIRES_DB) as conn:
+        rows = conn.execute(
+            "SELECT normalized_name FROM recommendations WHERE datetime(sent_at) >= datetime(?)",
+            (cutoff,),
+        ).fetchall()
+    names.update(r[0] for r in rows if r[0])
+
+    outbox_db = os.path.join(DB_DIR, "outbox.sqlite")
+    if os.path.exists(outbox_db):
+        try:
+            with sqlite3.connect(outbox_db) as conn:
+                rows = conn.execute("""
+                    SELECT body
+                    FROM messages
+                    WHERE source='discovery-butler'
+                      AND datetime(created_at) >= datetime(?)
+                      AND body LIKE '☕%'
+                """, (cutoff,)).fetchall()
+            for (body,) in rows:
+                parsed = extract_place_name_from_message(body or "")
+                if parsed:
+                    names.add(parsed)
+        except sqlite3.Error:
+            pass
+    return names
+
+
+def extract_place_name_from_message(body):
+    """Best-effort parse of old one-line discovery messages."""
+    text = (body or "").splitlines()[0]
+    if ":" in text:
+        text = text.split(":", 1)[1].strip()
+    for marker in (" — ", " - ", ", "):
+        if marker in text:
+            text = text.split(marker, 1)[0].strip()
+            break
+    if text.lower().startswith("try walk-in "):
+        text = text[len("try walk-in "):]
+    if text.lower().startswith("try "):
+        text = text[len("try "):]
+    return normalize_place_name(text)
+
+
+def record_recommendation(person, kind, key, pick, map_url):
+    name = pick.get("name") or "a spot"
+    with sqlite3.connect(FIRES_DB) as conn:
+        conn.execute("""
+            INSERT INTO recommendations (person, kind, key, place_name, normalized_name, map_url)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (person, kind, key, name, normalize_place_name(name), map_url))
         conn.commit()
 
 
@@ -172,6 +301,12 @@ def saved_place_names():
     return {r[0] for r in rows}
 
 
+def excluded_place_names():
+    names = {normalize_place_name(n) for n in saved_place_names()}
+    names.update(recent_recommendation_names())
+    return names
+
+
 def fetch_picks(anchor, criteria="third-wave coffee", minutes=12, top=5):
     """Call wanderlust-goat. Returns list of pick dicts."""
     cmd = [
@@ -184,32 +319,56 @@ def fetch_picks(anchor, criteria="third-wave coffee", minutes=12, top=5):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
     except subprocess.TimeoutExpired:
+        print(f"fetch_picks: TIMEOUT anchor={anchor} criteria={criteria!r}", file=sys.stderr)
         return []
+    stderr_head = (proc.stderr or "").splitlines()[:1]
+    print(f"fetch_picks: anchor={anchor} rc={proc.returncode} stdout_len={len(proc.stdout)} stderr_head={stderr_head}", file=sys.stderr)
     if proc.returncode != 0:
         return []
     try:
         data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"fetch_picks: PARSE_FAIL {e} stdout_head={proc.stdout[:200]!r}", file=sys.stderr)
         return []
-    return data.get("results") or []
+    results = data.get("results") or []
+    print(f"fetch_picks: results_count={len(results)}", file=sys.stderr)
+    return results
 
 
 def pick_one(results, exclude_names):
-    """Return first result whose name isn't in exclude_names, with business_status OPERATIONAL."""
+    """Return first operational result not saved, recently recommended, or blocked."""
     for r in results:
+        name = r.get("name") or ""
         if (r.get("business_status") or "").upper() != "OPERATIONAL":
             continue
-        if (r.get("name") or "").strip().lower() in exclude_names:
+        normalized = normalize_place_name(name)
+        if normalized in exclude_names or is_blocked_place(name):
+            print(f"pick_one: excluded {name!r}", file=sys.stderr)
             continue
         return r
     return None
+
+
+def map_url_for_pick(pick):
+    url = (pick.get("google_maps_uri") or pick.get("google_maps_url") or "").strip()
+    if url:
+        return url
+    query = " ".join(x for x in (pick.get("name"), pick.get("address")) if x)
+    return "https://www.google.com/maps/search/?" + urllib.parse.urlencode({"api": "1", "query": query})
+
+
+def with_map_link(line, pick):
+    map_url = map_url_for_pick(pick)
+    if map_url and map_url not in line:
+        return f"{line}\nMap: {map_url}", map_url
+    return line, map_url
 
 
 def compose_line(pick, framing, location_label):
     """Wrap the pick in a casual butler-voice one-liner.
 
     framing: 'weekend' or 'trip'.
-    Tries openai-codex/gpt-5.5 via OpenClaw gateway, falls back to Flash,
+    Tries openai/gpt-5.5 via OpenClaw gateway, falls back to Flash,
     final fallback is a deterministic template — never silent.
     """
     name = pick.get("name", "a spot")
@@ -297,13 +456,22 @@ def run_at_home(person, recipient, weekday, week_key, force=False):
     anchor = f"{lat},{lon}"
     picks = fetch_picks(anchor)
     if not picks:
-        alert_manan(f"no picks for {person} at {label}")
+        if force:
+            alert_manan(f"no picks for {person} at {label}")
+        else:
+            count = bump_attempt(person, "weekend", week_key)
+            if count >= MAX_ATTEMPTS:
+                alert_manan(f"no picks for {person} at {label} after {count} attempts")
+            else:
+                print(f"no picks for {person} at {label} (attempt {count}/{MAX_ATTEMPTS}, will retry)", file=sys.stderr)
         return False
-    chosen = pick_one(picks, saved_place_names())
+    chosen = pick_one(picks, excluded_place_names())
     if not chosen:
+        print(f"no usable picks for {person} at {label} after exclusions", file=sys.stderr)
         return False
-    line = compose_line(chosen, framing="weekend", location_label=label)
+    line, map_url = with_map_link(compose_line(chosen, framing="weekend", location_label=label), chosen)
     outbox_send(recipient, line)
+    record_recommendation(person, "weekend", week_key, chosen, map_url)
     mark_sent(person, "weekend", week_key)
     print(f"sent weekend nudge to {person} ({recipient}): {line}", file=sys.stderr)
     return True
@@ -326,13 +494,22 @@ def run_trip(trip, force=False):
         return False
     picks = fetch_picks(destination, criteria="third-wave coffee", minutes=15)
     if not picks:
-        alert_manan(f"no picks for trip {trip_id} ({destination})")
+        if force:
+            alert_manan(f"no picks for trip {trip_id} ({destination})")
+        else:
+            count = bump_attempt(chat_target, "trip", trip_id)
+            if count >= MAX_ATTEMPTS:
+                alert_manan(f"no picks for trip {trip_id} ({destination}) after {count} attempts")
+            else:
+                print(f"no picks for trip {trip_id} ({destination}) (attempt {count}/{MAX_ATTEMPTS}, will retry)", file=sys.stderr)
         return False
-    chosen = pick_one(picks, saved_place_names())
+    chosen = pick_one(picks, excluded_place_names())
     if not chosen:
+        print(f"no usable picks for trip {trip_id} ({destination}) after exclusions", file=sys.stderr)
         return False
-    line = compose_line(chosen, framing="trip", location_label=destination)
+    line, map_url = with_map_link(compose_line(chosen, framing="trip", location_label=destination), chosen)
     outbox_send(chat_target, line, trip_id=trip_id)
+    record_recommendation(chat_target, "trip", trip_id, chosen, map_url)
     mark_sent(chat_target, "trip", trip_id)
     print(f"sent trip nudge for {trip_id} → {chat_target}: {line}", file=sys.stderr)
     return True
@@ -358,11 +535,11 @@ def main():
         # Smoke path: hit wanderlust + compose for Manan at home, print only.
         lat, lon, label = ha_location("manan")
         picks = fetch_picks(f"{lat},{lon}")
-        chosen = pick_one(picks, saved_place_names()) if picks else None
+        chosen = pick_one(picks, excluded_place_names()) if picks else None
         if not chosen:
             print("smoke: no usable pick", file=sys.stderr)
             sys.exit(1)
-        print(compose_line(chosen, framing="weekend", location_label=label))
+        print(with_map_link(compose_line(chosen, framing="weekend", location_label=label), chosen)[0])
         sys.exit(0)
 
     sent_any = False

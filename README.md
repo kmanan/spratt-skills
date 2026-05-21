@@ -94,8 +94,8 @@ A friend who knows the area and occasionally texts you a fun spot. Daily 2:00pm 
 
 | | |
 |---|---|
-| **What you get** | `scripts/nudge.py` (~280 lines — discovery, dedup vs places.sqlite, compose with LLM gateway, outbox-routed delivery, fires-DB dedup), SKILL.md, launchd plist example |
-| **Dependencies** | [`wanderlust-goat-pp-cli`](https://github.com/mvanhorn/printing-press-library) (needs `GOOGLE_PLACES_API_KEY`), OpenClaw with gateway access to `openai-codex/gpt-5.5` (or any compose model — falls back to Flash, then deterministic template), Spratt's outbox CLI, Home Assistant `person.*` + Places integration (optional — falls back to a hardcoded home anchor), `trips.sqlite` with `trips` + `travelers` tables (optional — at-home flow works without it) |
+| **What you get** | `scripts/nudge.py` (discovery, saved-place dedup, 180-day recommendation cooldown, hard-block list, Google Maps links, compose with LLM gateway, outbox-routed delivery), SKILL.md, launchd plist example |
+| **Dependencies** | [`wanderlust-goat-pp-cli`](https://github.com/mvanhorn/printing-press-library) (needs `GOOGLE_PLACES_API_KEY`), OpenClaw with gateway access to `openai/gpt-5.5` (or any compose model — falls back to Flash, then deterministic template), Spratt's outbox CLI, Home Assistant `person.*` + Places integration (optional — falls back to a hardcoded home anchor), `trips.sqlite` with `trips` + `travelers` tables (optional — at-home flow works without it) |
 | **Schedule** | launchd `com.spratt.discovery-butler` daily 2:00pm. Mostly silent. Smoke-test path: `python3 nudge.py --smoke` (compose + print, no outbox/DB writes). |
 | **macOS-specific** | launchd plist is macOS-specific; underlying script is portable. |
 | **Setup time** | ~10 minutes once `wanderlust-goat-pp-cli` is installed and `GOOGLE_PLACES_API_KEY` is in env. |
@@ -313,13 +313,13 @@ launchd com.spratt.discovery-butler (daily 2pm, mostly silent)
                     ↓
               wanderlust-goat-pp-cli goat <anchor> --criteria "third-wave coffee" --agent
                     ↓
-              dedup vs places.sqlite (already-saved names) + business_status=OPERATIONAL
+              exclude saved places + recent recommendations + blocked names; require business_status=OPERATIONAL
                     ↓
-              openclaw infer model run --gateway --model openai-codex/gpt-5.5 (Flash fallback)
+              openclaw infer model run --gateway --model openai/gpt-5.5 (Flash fallback)
                     ↓
-              outbox.sqlite → at-home: Manan + Harshita (separate); trip: trip.group_chat_guid
+              append Google Maps link; outbox.sqlite → at-home: Manan + Harshita (separate); trip: trip.group_chat_guid
                     ↓
-              discovery_fires.sqlite marks (person, kind, key) so it can't re-fire
+              discovery_fires.sqlite marks send keys + recommendation history
 
 Human → "plan meals this week"
                     ↓

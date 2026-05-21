@@ -29,17 +29,18 @@ Dedup: `~/.config/spratt/db/discovery_fires.sqlite`, PK `(person, kind, key)`. W
 ## How it works
 
 1. **Discovery** — `wanderlust-goat-pp-cli goat <anchor> --criteria "third-wave coffee" --minutes 12 --top 5 --agent` returns ranked picks (deterministic, no LLM). Fields used: `name`, `address`, `lat`, `lng`, `walking_minutes`, `score.total`, `why`, `google_maps_uri`, `business_status` (filter to `OPERATIONAL`).
-2. **Dedup** — exclude picks whose lowercased name appears in `places.sqlite` (already-saved spots). First remaining pick wins.
-3. **Compose** — `openclaw infer model run --gateway --model openai-codex/gpt-5.5 --prompt <...> --json` wraps the pick in a casual butler-voice line under 22 words. Flash fallback (`google/gemini-2.5-flash`). Final fallback is a deterministic template — never silent.
-4. **Send** — `outbox.py schedule --to <recipient> --body <line> --at now --source discovery-butler --created-by discovery-butler`. Trip nudges include `--trip-id <trip_id>` for cross-referencing.
-5. **Mark sent** — insert into `fires` so the same person/trip can't be re-nudged.
+2. **Dedup / blocklist** — exclude picks whose normalized name appears in `places.sqlite` (already-saved spots), was recommended by discovery-butler in the last 180 days, or appears in the script's `BLOCKED_PLACE_NAMES`. First remaining pick wins.
+3. **Compose** — `openclaw infer model run --gateway --model openai/gpt-5.5 --prompt <...> --json` wraps the pick in a casual butler-voice line under 22 words. Flash fallback (`google/gemini-2.5-flash`). Final fallback is a deterministic template — never silent.
+4. **Link** — append `Map: <url>` to every sent recommendation, using `google_maps_uri` when present and falling back to a Google Maps search URL.
+5. **Send** — `outbox.py schedule --to <recipient> --body <line> --at now --source discovery-butler --created-by discovery-butler`. Trip nudges include `--trip-id <trip_id>` for cross-referencing.
+6. **Mark sent** — insert into `fires` so the same person/trip can't be re-nudged, and insert into `recommendations` so the same place is suppressed for 180 days.
 
 ## Wiring
 
 | | |
 |---|---|
-| **What you get** | `scripts/nudge.py` (~280 lines), `SKILL.md`, launchd plist example |
-| **Dependencies** | `wanderlust-goat-pp-cli` (from [printing-press-library](https://github.com/mvanhorn/printing-press-library) — needs `GOOGLE_PLACES_API_KEY`), OpenClaw with gateway access to `openai-codex/gpt-5.5` (or any other compose model — see below), an outbox CLI on the same host (this skill expects Spratt's `~/.config/spratt/infrastructure/outbox/outbox.py`), Home Assistant `person.*` + Places integration for the at-home location lookup (optional — falls back to a hardcoded `HOME_LAT`/`HOME_LON`), `trips.sqlite` with `trips` + `travelers` tables for trip routing (optional — at-home flow works without it) |
+| **What you get** | `scripts/nudge.py`, `SKILL.md`, launchd plist example |
+| **Dependencies** | `wanderlust-goat-pp-cli` (from [printing-press-library](https://github.com/mvanhorn/printing-press-library) — needs `GOOGLE_PLACES_API_KEY`), OpenClaw with gateway access to `openai/gpt-5.5` (or any other compose model — see below), an outbox CLI on the same host (this skill expects Spratt's `~/.config/spratt/infrastructure/outbox/outbox.py`), Home Assistant `person.*` + Places integration for the at-home location lookup (optional — falls back to a hardcoded `HOME_LAT`/`HOME_LON`), `trips.sqlite` with `trips` + `travelers` tables for trip routing (optional — at-home flow works without it) |
 | **Schedule** | launchd `com.spratt.discovery-butler` daily 2:00pm. Mostly silent — only fires on Thursday/Friday at home or on day 1–3 of an active trip. |
 | **macOS-specific** | launchd plist is macOS-specific; underlying script is portable to any cron. |
 | **Setup time** | ~10 minutes once `wanderlust-goat-pp-cli` is installed and `GOOGLE_PLACES_API_KEY` is in env. |
@@ -83,6 +84,14 @@ HOME_LAT, HOME_LON, HOME_LABEL = 47.674, -122.122, "Redmond, WA"
 ```
 
 Compose model: edit `GATEWAY_MODEL` / `GATEWAY_FALLBACK`. If you don't use OpenClaw's gateway, the deterministic template kicks in and the script is still usable — just less voice-y.
+
+Recommendation state:
+
+- `fires`: one send per person/week or trip.
+- `attempts`: retry counter for the two launchd firings.
+- `recommendations`: sent place history with normalized names and map URLs. The script also parses existing discovery-butler outbox messages so older sends are excluded before they exist in this table.
+
+Hard-blocked places live in `BLOCKED_PLACE_NAMES` at the top of `scripts/nudge.py`.
 
 ## What's intentionally NOT in v1
 
