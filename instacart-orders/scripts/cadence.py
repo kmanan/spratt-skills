@@ -2,12 +2,6 @@
 """
 Instacart purchase cadence — reads instacart-pp-cli's SQLite history DB.
 
-Originally based on the smart-replenishment idea in the `instacart-skill` by
-bigdaddyluke on ClawHub (https://clawhub.com/skills/instacart-skill). His
-skill was an LLM-driven browser cart-builder; this is the SQL-backed
-descendant that runs over canonical Instacart item_ids supplied by
-mvanhorn's `instacart-pp-cli`.
-
 Replaces the Instacart half of purchase-cadence.py (which reads
 orders.sqlite with regex-normalized item names). Groups by canonical
 (item_id, retailer_slug) which is stable across orders, computes median
@@ -21,15 +15,104 @@ call `instacart add --item-id`.
 
 import argparse
 import json
+import math
 import os
+import re
 import sqlite3
 import sys
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from statistics import median
 
+
+def recency_match(days_since, cadence_days):
+    if cadence_days <= 0:
+        return 0.0
+    ratio = days_since / cadence_days
+    if ratio < 0.5:
+        return 0.0
+    if ratio <= 1.5:
+        return 1.0
+    if ratio <= 3.0:
+        return (3.0 - ratio) / 1.5
+    return 0.0
+
+
+def confidence(purchases):
+    return min(1.0, max(0.0, (purchases - 1) / 4))
+
+
+def compute_score(purchases, cadence_days, days_since):
+    return (math.log(purchases + 1)
+            * recency_match(days_since, cadence_days)
+            * confidence(purchases))
+
+
 HOME = os.path.expanduser("~")
 CLI_DB = f"{HOME}/Library/Application Support/instacart/instacart.db"
+
+
+def _tokens(name):
+    return set(re.findall(r"[a-z0-9]+", (name or "").lower()))
+
+
+def cadence_family_key(name, retailer_slug):
+    """Return a family key for products where exact historical SKUs drift.
+
+    Instacart item IDs are too literal for recurring cart construction: a stale
+    flavor/size SKU can look overdue even after a sibling SKU was just bought.
+    Keep this deliberately narrow and auditable so unrelated products still use
+    exact item IDs.
+    """
+    toks = _tokens(name)
+    if "lacroix" in toks:
+        return ("family", retailer_slug, "lacroix")
+
+    if "milk" in toks and not ({"yogurt", "yoghurt", "formula"} & toks):
+        # Milk package/brand SKUs churn often; yogurt/formula are separate items.
+        if "whole" in toks or "vitamin" in toks:
+            return ("family", retailer_slug, "whole-milk")
+
+    if "butter" in toks:
+        # Salted and unsalted are not interchangeable.
+        if "unsalted" in toks:
+            return ("family", retailer_slug, "butter", "unsalted")
+        if "salted" in toks or "salt" in toks:
+            return ("family", retailer_slug, "butter", "salted")
+
+    if "onion" in toks or "onions" in toks:
+        if "red" in toks:
+            return ("family", retailer_slug, "red-onions")
+
+    if "tomato" in toks or "tomatoes" in toks:
+        if not ({"ketchup", "soup", "paste", "sauce"} & toks):
+            return ("family", retailer_slug, "fresh-tomatoes")
+
+    return None
+
+
+def auto_stage_decision(row):
+    """Separate "worth mentioning" from "safe to mutate the cart".
+
+    The nudge can surface broad due items. Cart mutation should stay limited to
+    high-confidence staples that are still inside their normal repeat window.
+    """
+    reasons = []
+    if row["status"] != "due":
+        reasons.append("not due")
+    if row["purchases"] < 6:
+        reasons.append("fewer than 6 purchase dates")
+    if row["cadence_days"] > 60:
+        reasons.append("cadence longer than 60 days")
+    if row["days_since"] > 90:
+        reasons.append("last purchase older than 90 days")
+    if row["recency_ratio"] > 1.75:
+        reasons.append("more than 1.75x normal cadence")
+    if row["score"] < 1.5:
+        reasons.append("low reorder score")
+    if row.get("quantity") is not None and float(row["quantity"]) % 1 != 0:
+        reasons.append("fractional historical quantity")
+    return (not reasons, reasons)
 
 
 def fetch_history(db_path, store=None):
@@ -65,6 +148,8 @@ def fetch_history(db_path, store=None):
             r["quantity"] or 1,
             r["quantity_type"] or "each",
             r["product_id"] or "",
+            r["item_id"],
+            r["retailer_slug"],
         ))
     return history
 
@@ -87,10 +172,23 @@ def compute_cadence_days(unix_timestamps):
 
 def analyze(db_path, store=None, min_purchases=2):
     history = fetch_history(db_path, store=store)
-    today = date.today()
+    today = datetime.now(timezone.utc).date()
     results = []
+    family_history = defaultdict(list)
+    exact_history = {}
 
     for (item_id, retailer_slug), events in history.items():
+        family_key = cadence_family_key(events[-1][1], retailer_slug)
+        if family_key:
+            family_history[family_key].extend(events)
+        else:
+            exact_history[(item_id, retailer_slug)] = events
+
+    combined_history = dict(exact_history)
+    combined_history.update(family_history)
+
+    for key, events in combined_history.items():
+        item_id, retailer_slug = (key[1], key[2]) if key[0] == "family" else key
         unix_dates = sorted({
             datetime.fromtimestamp(e[0], tz=timezone.utc).date().isoformat()
             for e in events
@@ -104,7 +202,7 @@ def analyze(db_path, store=None, min_purchases=2):
 
         last_iso = unix_dates[-1]
         last_date = datetime.strptime(last_iso, "%Y-%m-%d").date()
-        days_since = (today - last_date).days
+        days_since = max(0, (today - last_date).days)
 
         if days_since >= cadence:
             status = "due"
@@ -113,24 +211,31 @@ def analyze(db_path, store=None, min_purchases=2):
         else:
             status = "not_due"
 
-        latest = events[-1]
-        results.append({
+        latest = max(events, key=lambda e: e[0])
+        med_qty = median([e[2] for e in events]) or 1
+        score = compute_score(len(unix_dates), cadence, days_since)
+        recency_ratio = round(days_since / cadence, 2) if cadence > 0 else 0.0
+        row = {
             "item": latest[1],
-            "canonical_key": item_id,
+            "canonical_key": ":".join(map(str, key)) if key[0] == "family" else item_id,
             "purchases": len(unix_dates),
             "cadence_days": round(cadence, 1),
             "days_since": days_since,
             "last_purchased": last_iso,
             "status": status,
-            "retailer_slug": retailer_slug,
-            "item_id": item_id,
+            "score": round(score, 3),
+            "recency_ratio": recency_ratio,
+            "retailer_slug": latest[6],
+            "item_id": latest[5],
             "product_id": latest[4],
-            "quantity": latest[2],
+            "quantity": med_qty,
             "quantity_type": latest[3],
-        })
+            "cadence_group": "family" if key[0] == "family" else "item",
+        }
+        row["auto_stage"], row["auto_stage_reasons"] = auto_stage_decision(row)
+        results.append(row)
 
-    status_order = {"due": 0, "soon": 1, "not_due": 2}
-    results.sort(key=lambda r: (status_order[r["status"]], -r["days_since"]))
+    results.sort(key=lambda r: -r["score"])
     return results
 
 
@@ -145,7 +250,10 @@ def main():
 
     results = analyze(CLI_DB, store=args.store, min_purchases=args.min_purchases)
     if args.due_only:
-        results = [r for r in results if r["status"] in ("due", "soon")]
+        results = [r for r in results
+                   if r["status"] in ("due", "soon")
+                   and r["purchases"] >= 4
+                   and r["recency_ratio"] <= 3]
 
     if args.format == "json":
         print(json.dumps(results, indent=2))

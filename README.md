@@ -66,7 +66,7 @@ A persistent daemon that polls FlightAware AeroAPI, detects events (landing, del
 
 The job-to-be-done: figure out what we're about to run out of, pre-stage those items in our Instacart cart Wednesday and Saturday mornings, and send one text — "🛒 cart is staged, tap Place Order in the app." Ignore the text and nothing ships. Tap once and groceries arrive. Same flow every week. The "we're out of milk again" problem stops being a problem.
 
-**The CLI — order tracking + cart building.** [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) is the single source of truth for both directions. Nightly at 9pm, `history-scrape.py` imports the day's orders into a local SQLite DB with canonical `item_id`, retailer, quantity, and delivered_at — the same identifiers Instacart uses internally. When it's time to reorder, `cart-build.py` calls the CLI's `add <retailer> --item-id <id>` against those same IDs. Direct GraphQL both ways. No browser, no DOM scraping, no fuzzy name matching, no autosuggest roulette.
+**The CLI — order tracking + cart building.** [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) is the single source of truth for both directions. Nightly at 9pm, `history-scrape.py` imports the day's orders into a local SQLite DB with canonical `item_id`, retailer, quantity, and delivered_at — the same identifiers Instacart uses internally. When it's time to reorder, `cart-build.py` calls the CLI's `add <retailer> --item-id <id>` against those same IDs. Direct GraphQL both ways. No browser, no DOM scraping. If Instacart rejects an old stored ID, the fallback searches by name but only accepts category/flavor-safe matches.
 
 **The intelligence — cadence + reorder recommendation.** A SQL analyzer reads order history and computes the median days between purchases for every `(item_id, retailer)` pair we've bought at least twice. Items get tagged `due`, `soon`, or `not_due`. Instacart's canonical IDs make this trivial — "QFC organic whole milk, half gallon" is the same row across every order, regardless of how their UI renders it.
 
@@ -78,7 +78,7 @@ The job-to-be-done: figure out what we're about to run out of, pre-stage those i
 
 | | |
 |---|---|
-| **What you get** | `history-scrape.py` (nightly Apollo-cache import via the CLI's bundled `docs/extract-one.js`), `cadence.py` (Instacart-side reorder analysis on canonical item IDs), `cart-build.py` (deterministic cart staging via `--item-id`), `reorder-nudge.py` (cart-status-aware iMessage with checkout URL), SQLite schema (`reorder_notifications` for dedup), SKILL.md files for both `instacart-orders` and `instacart-api`, three launchd plist examples |
+| **What you get** | `history-scrape.py` (nightly Apollo-cache import via the CLI's bundled `docs/extract-one.js`), `cadence.py` (Instacart-side reorder analysis with narrow family grouping for SKU drift and conservative `auto_stage` gating), `cart-build.py` (deterministic cart staging via `--item-id`, safe ID-rot fallback, active-cart duplicate skips), `reorder-nudge.py` (cart-status-aware iMessage with checkout URL), SQLite schema (`reorder_notifications` for dedup), SKILL.md files for both `instacart-orders` and `instacart-api`, three launchd plist examples |
 | **Dependencies** | [`instacart-pp-cli`](https://github.com/mvanhorn/printing-press-library) (Go binary by mvanhorn, ships `docs/extract-one.js`), an active Instacart session (`auth login` or `auth paste`), [Outbox](./outbox/) for message delivery |
 | **Schedule** | `com.spratt.instacart-history-scrape` nightly 9pm PT. `com.spratt.instacart-cart-build` Wed + Sat 7:45am PT. `com.spratt.reorder-nudge` Wed + Sat 8am PT (15 min later, so the message can describe what actually staged). |
 | **macOS-specific** | launchd plists; underlying scripts run anywhere with cron/systemd. |
@@ -290,9 +290,10 @@ Email → email scan cron (Flash triage → extract)
 
               launchd com.spratt.instacart-cart-build (Wed + Sat 7:45am)
                     ↓
-              cart-build.py → cadence.py --due-only (median day-gap per item_id, retailer)
+              cart-build.py → cadence.py --due-only (median day-gap per item/family, retailer)
                     ↓
               `instacart-pp-cli add <retailer> --item-id <id> --qty N --yes` per due item
+              on ID rot: search top 5, accept only category/flavor-safe matches
                     ↓
               Instacart cart staged (CLI has no `place` — Manan opens app, taps Place Order)
                     ↓
