@@ -6,6 +6,24 @@ A collection of infrastructure add-ons for [OpenClaw](https://github.com/opencla
 
 These aren't typical OpenClaw skills (SKILL.md files that teach the LLM what to do). Most are **infrastructure** — daemons, databases, pipelines, and automation that run alongside OpenClaw, handling the things an LLM shouldn't be trusted to do reliably. Some (Apple Reminders, Tool Routing) are pure skill definitions that teach the LLM correct tool selection and usage patterns.
 
+Here are some examples of this setup in my daily life:
+
+https://x.com/manan/status/2041386093728444892?s=20
+
+[![](https://tweeco.pushkaryadav.in/api/id/2041386093728444892)](https://tweeco.pushkaryadav.in)
+
+https://x.com/manan/status/2048473538949161377?s=20
+
+[![](https://tweeco.pushkaryadav.in/api/id/2048473538949161377)](https://tweeco.pushkaryadav.in)
+
+https://x.com/manan/status/2055664206180131260?s=20
+
+[![](https://tweeco.pushkaryadav.in/api/id/2055664206180131260)](https://tweeco.pushkaryadav.in)
+
+https://x.com/manan/status/2056769727813595319?s=20
+
+[![](https://tweeco.pushkaryadav.in/api/id/2056769727813595319)](https://tweeco.pushkaryadav.in)
+
 ## The Core Idea: LLM Plans, Code Delivers
 
 Every component follows the same principle: the LLM decides what to do, deterministic code executes it. No LLM is involved at message delivery time, flight polling time, or database write time. The LLM's job is language and reasoning. Code handles reliability.
