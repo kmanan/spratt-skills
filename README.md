@@ -8,21 +8,11 @@ These aren't typical OpenClaw skills (SKILL.md files that teach the LLM what to 
 
 Here are some examples of this setup in my daily life:
 
-https://x.com/manan/status/2041386093728444892?s=20
+<img width="1920" height="1139" alt="image" src="https://github.com/user-attachments/assets/23f43fc0-b3d4-4d91-9f01-cac1a359386c" />
 
-[![](https://tweeco.pushkaryadav.in/api/id/2041386093728444892)](https://tweeco.pushkaryadav.in)
+<img width="1100" height="2048" alt="image" src="https://github.com/user-attachments/assets/23aca363-50f8-4149-bcc2-df6c0c50c45d" /> <img width="947" height="2048" alt="image" src="https://github.com/user-attachments/assets/7ca84933-e37d-4abd-8117-de476fa73e9e" /> <img width="1206" height="1907" alt="image" src="https://github.com/user-attachments/assets/08a1bd33-d6ba-4aac-908a-af1ff2108800" /> <img width="1152" height="2048" alt="image" src="https://github.com/user-attachments/assets/bcf0585d-dc8f-4532-8a46-89e0dd9486f7" />
 
-https://x.com/manan/status/2048473538949161377?s=20
-
-[![](https://tweeco.pushkaryadav.in/api/id/2048473538949161377)](https://tweeco.pushkaryadav.in)
-
-https://x.com/manan/status/2055664206180131260?s=20
-
-[![](https://tweeco.pushkaryadav.in/api/id/2055664206180131260)](https://tweeco.pushkaryadav.in)
-
-https://x.com/manan/status/2056769727813595319?s=20
-
-[![](https://tweeco.pushkaryadav.in/api/id/2056769727813595319)](https://tweeco.pushkaryadav.in)
+<img width="1152" height="2048" alt="image" src="https://github.com/user-attachments/assets/9fdae6a7-bd11-4ebd-b8fa-78bf1b0b73e5" /> <img width="1152" height="2048" alt="image" src="https://github.com/user-attachments/assets/f1694029-9f6f-4496-b70d-c71874273279" /> <img width="1152" height="2048" alt="image" src="https://github.com/user-attachments/assets/dfd5450b-8fd2-4613-9c55-238c97a830ed" /> <img width="1152" height="2048" alt="image" src="https://github.com/user-attachments/assets/dbfaf744-a9db-45e0-8a35-95a2967a3ec8" />
 
 ## The Core Idea: LLM Plans, Code Delivers
 
