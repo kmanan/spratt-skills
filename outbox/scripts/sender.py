@@ -9,6 +9,7 @@ sends iMessages. Everything else writes to the outbox.
 Managed by launchd (com.spratt.outbox-sender).
 """
 
+import json
 import sys
 import os
 import time
@@ -48,15 +49,37 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def resolve_chat_id(identifier):
+    """Look up imsg numeric chat row ID from a chat identifier string."""
+    try:
+        result = subprocess.run(
+            [IMSG_BIN, "chats", "list", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.strip().splitlines():
+            chat = json.loads(line)
+            if chat.get("identifier") == identifier:
+                return str(chat["id"])
+    except Exception:
+        pass
+    return None
+
+
 def send_via_imsg(recipient, body):
     """Send one iMessage via imsg CLI. Returns (success, error_string)."""
+    text_body = "\n" + body if body.startswith("-") else body
     if recipient.startswith("chat_guid:"):
-        guid = recipient[len("chat_guid:"):]
-        cmd = [IMSG_BIN, "send", "--chat-guid", guid, "--text", body, "--json"]
+        identifier = recipient[len("chat_guid:"):]
+        chat_id = resolve_chat_id(identifier)
+        if chat_id is None:
+            return False, f"could not resolve chat identifier {identifier!r} to a chat id"
+        cmd = [IMSG_BIN, "send", "--chat-id", chat_id, "--text", text_body, "--json"]
     elif recipient.isdigit():
-        cmd = [IMSG_BIN, "send", "--chat-id", recipient, "--text", body, "--json"]
+        cmd = [IMSG_BIN, "send", "--chat-id", recipient, "--text", text_body, "--json"]
     else:
-        cmd = [IMSG_BIN, "send", "--to", recipient, "--text", body, "--json"]
+        cmd = [IMSG_BIN, "send", "--to", recipient, "--text", text_body, "--json"]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
