@@ -34,6 +34,18 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+sys.path.insert(0, os.path.expanduser("~/.config/spratt"))
+try:
+    from infrastructure.lib.insights import upsert_insight
+except Exception:
+    sys.path.insert(
+        0,
+        os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "serendipity-insights", "scripts")
+        ),
+    )
+    from insights import upsert_insight
+
 ROOT = os.path.expanduser("~/.config/spratt")
 DB_DIR = os.path.join(ROOT, "db")
 FIRES_DB = os.path.join(DB_DIR, "discovery_fires.sqlite")
@@ -218,6 +230,24 @@ def record_recommendation(person, kind, key, pick, map_url):
             VALUES (?, ?, ?, ?, ?, ?)
         """, (person, kind, key, name, normalize_place_name(name), map_url))
         conn.commit()
+    upsert_insight(
+        kind="discovery",
+        owner=person if person in {"manan", "harshita"} else "both",
+        title=f"Try {name}",
+        summary=pick.get("why") or pick.get("address") or "",
+        suggested_action="Walk-in recommendation surfaced by discovery-butler.",
+        source="discovery",
+        source_ref=f"{kind}:{key}:{normalize_place_name(name)}",
+        evidence={
+            "place": pick,
+            "map_url": map_url,
+            "cooldown_days": RECOMMENDATION_COOLDOWN_DAYS,
+        },
+        confidence=0.72,
+        status="surfaced",
+        reconciliation_state="reconciled",
+        surface_policy="already_surfaced",
+    )
 
 
 def ha_location(person):

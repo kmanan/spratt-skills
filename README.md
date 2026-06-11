@@ -108,7 +108,21 @@ A friend who knows the area and occasionally texts you a fun spot. Daily 2:00pm 
 | **macOS-specific** | launchd plist is macOS-specific; underlying script is portable. |
 | **Setup time** | ~10 minutes once `wanderlust-goat-pp-cli` is installed and `GOOGLE_PLACES_API_KEY` is in env. |
 
-### 6. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
+### 6. [Serendipity Insights](./serendipity-insights/) — One Queue for Useful Things Spratt Notices
+
+A shared SQLite-backed candidate insight layer. Producers such as email scan, briefing opportunity refresh, discovery-butler, saved places, trips, cards, and calendar/reminder checks can write compact "worth surfacing" candidates to one table. Surfaces such as briefings and digests read from that queue after deterministic reconciliation. This keeps serendipity out of profile Markdown, `MEMORY.md`, heartbeat, dreaming, and one-off side tables.
+
+**Why it exists:** Spratt needs room to notice patterns and useful opportunities without turning memory into a junk drawer or letting every feature invent its own recommendation queue. The insight table stores candidates and surfaced items; source-of-truth facts stay in their real systems.
+
+| | |
+|---|---|
+| **What you get** | `SKILL.md` routing contract, `scripts/insights.py` shared helper, `schemas/insights.sql`; discovery-butler runtime writes surfaced picks into the queue. |
+| **Dependencies** | Python 3, SQLite, existing Spratt source-of-truth stores. |
+| **Schedule** | N/A. Producers write when they run; surfaces read when composing briefings/digests or recommendations. |
+| **macOS-specific** | No. |
+| **Setup time** | ~5 minutes; copy the helper into `~/.config/spratt/infrastructure/lib/insights.py` or import the packaged helper directly. |
+
+### 7. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
 
 Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft Graph API. Multi-account OAuth2 with auto-refreshing tokens. Calendar events support descriptions, attendees, and multi-calendar targeting — create a family appointment on the "For Family" calendar with attendees and notes in one command.
 
@@ -122,7 +136,7 @@ Shell scripts for managing Outlook/Hotmail email and calendar through Microsoft 
 | **macOS-specific** | No |
 | **Setup time** | ~10 minutes |
 
-### 7. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
+### 8. [Places](./places/) — Save & Search Restaurants, Activities, Attractions
 
 A SQLite database for places you want to remember — restaurants, bars, activities, attractions. Share an Instagram post, Google Maps link, Yelp page, or just say "remember that Thai place on Queen West" and it gets saved with category, cuisine, location, tags, and notes. Query by vibe ("date night spots"), location, cuisine, or who saved it. Track visits and ratings.
 
@@ -136,7 +150,7 @@ A SQLite database for places you want to remember — restaurants, bars, activit
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes |
 
-### 8. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
+### 9. [Destination-Aware Reminders](./destination-aware/) — Tesla Nav → Context Surfacing
 
 When you set a destination in your Tesla, this daemon detects it via Home Assistant's WebSocket `subscribe_trigger` and surfaces relevant context before you arrive — shopping lists for grocery stores, appointment notes for doctors, pickup reminders for daycare. No zones, no polling, no HA automations. The Tesla tells HA where you're going, the daemon identifies what's there via Google Places, and sends a text with what you need to know. Every category (grocery, daycare, pharmacy, medical, home, work, restaurant) runs through Haiku with a category-specific prompt so unrelated todos don't get dumped into the message. Now includes full instructions for **creating destination-aware reminders** — recurring (weekly day-specific), one-time, and permanent — with rules for how the temporal gate and LLM filter interact so reminders fire on the right day and for the right destination.
 
@@ -150,7 +164,7 @@ When you set a destination in your Tesla, this daemon detects it via Home Assist
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~10 minutes (after Outbox is set up). See [destination-aware/README.md](./destination-aware/README.md) for deployment gotchas. |
 
-### 9. [Delivery Watcher](./delivery-watcher/) — On-Porch Package Alerts
+### 10. [Delivery Watcher](./delivery-watcher/) — On-Porch Package Alerts
 
 KeepAlive daemon that texts both principals when an Amazon or Instacart package is **delivered** and the front-door contact sensor hasn't changed state in the 5 minutes since. The trigger is a sender+subject hook inside the existing email-scan job (no LLM, no body parsing, no mailbox polling in this daemon) that writes a row into `delivery_signals.sqlite`; the daemon polls that local table every 30s. The Ring door sensor in Home Assistant is the "did you already grab it" gate. No camera, no vision, no OCR — the carrier already tells us *which* order arrived.
 
@@ -164,7 +178,7 @@ KeepAlive daemon that texts both principals when an Amazon or Instacart package 
 | **macOS-specific** | launchd plist (KeepAlive). Adaptable to systemd. |
 | **Setup time** | ~5 minutes once email-scan + HA + outbox are wired |
 
-### 10. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
+### 11. [Card Wallet](./card-wallet/) — Credit Card Benefits + Purchase Optimization
 
 Merged skill that tracks both **"use it or lose it" credit card benefits** (monthly credits, quarterly categories, semi-annual windows) and **per-purchase reward optimization** ("which card for groceries?"). A weekly cron checks expiring benefits and notifies each cardholder with a tiered-brevity format — urgent and this-period items show full detail, while 30+ day items collapse into a single summary line to keep the message scannable. A monthly LLM-powered refresh searches the web for benefit and reward rate changes. Interactive queries recommend the optimal card per spending category with cap awareness and network acceptance warnings (Amex fallbacks).
 
@@ -178,7 +192,7 @@ Merged skill that tracks both **"use it or lose it" credit card benefits** (mont
 | **macOS-specific** | Apple Reminders via remindctl (optional — remove reminder creation for Linux) |
 | **Setup time** | ~10 minutes (after Outbox is set up) |
 
-### 11. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
+### 12. [Meal Planner](./meal-planner/) — Weekly Meal Planning with Instacart Integration
 
 Weekly meal planning that reads from your recipe database, checks pantry inventory, and generates shopping lists that feed directly into the [Instacart](./instacart-api/) pipeline. Handles dietary restrictions, household coordination (adults vs kids), batch cooking, and budget tracking. Based on the [meal-planner](https://clawhub.com/skills/meal-planner) skill from ClawHub (by clawic), adapted to use SQLite-backed recipes and the Instacart CLI cart-builder instead of static lists.
 
@@ -192,7 +206,7 @@ Weekly meal planning that reads from your recipe database, checks pantry invento
 | **macOS-specific** | No |
 | **Setup time** | ~5 minutes + first-use household onboarding conversation |
 
-### 12. [Apple Reminders](./apple-reminders/) — Full Reminders Management + Recurring Support
+### 13. [Apple Reminders](./apple-reminders/) — Full Reminders Management + Recurring Support
 
 Full Apple Reminders management via the `remindctl` CLI (view, add, edit, complete, delete, list routing) plus a compiled Swift binary for recurring reminders via EventKit. The `remindctl` CLI doesn't support recurrence natively, so the EventKit binary fills that gap.
 
@@ -206,7 +220,7 @@ Full Apple Reminders management via the `remindctl` CLI (view, add, edit, comple
 | **macOS-specific** | Yes (EventKit is Apple-only) |
 | **Setup time** | ~2 minutes (compile + grant permissions) |
 
-### 13. [Email PDF Attachment](./email-pdf-attachment/) — Native PDF Extraction from Email
+### 14. [Email PDF Attachment](./email-pdf-attachment/) — Native PDF Extraction from Email
 
 Skill instructions for finding Outlook/Gmail emails with PDF attachments, downloading them to an OpenClaw-allowed media path, and reading them through OpenClaw's native PDF capability. The scheduled Spratt email scan uses the same principle: PDF attachments are processed through OpenClaw's bundled `document-extract` PDF extractor before LLM structured extraction.
 
@@ -220,7 +234,7 @@ Skill instructions for finding Outlook/Gmail emails with PDF attachments, downlo
 | **macOS-specific** | No for extraction; downstream actions may use macOS Reminders/Calendar depending on the workflow |
 | **Setup time** | ~2 minutes if email auth is already configured |
 
-### 14. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
+### 15. [Tool Routing](./tool-routing/) — Intent-to-Tool Mapping
 
 A routing table that maps user intents to the correct tool or skill. Covers messaging (live `message` vs scheduled `outbox`), productivity tools, web/browser, trips, email attachments, the "what are our plans?" multi-source check, forwarded-email semantics, and the cron-vs-outbox hard boundary. Also includes TaskFlow guidance for multi-step interactive workflows (trip planning, Instacart cart building, Resy bookings) that span multiple turns and need durable state tracking.
 
@@ -234,7 +248,7 @@ A routing table that maps user intents to the correct tool or skill. Covers mess
 | **macOS-specific** | No |
 | **Setup time** | ~1 minute (copy to skills directory) |
 
-### 15. [Wanderlust](./wanderlust/) — Walking-Distance Place Discovery
+### 16. [Wanderlust](./wanderlust/) — Walking-Distance Place Discovery
 
 A CLI-driven walking-distance discovery engine that powers two surfaces: (1) the scheduled trip-city daily ping that wakes each active trip's iMessage chat with weather + 3 picks each morning, and (2) ad-hoc coffee-shop recommendations during regular conversation ("coffee shop we can walk to from the Seattle Aquarium" → top picks ranked by walking time and signal across Google Places, Reddit, Wikipedia, and Atlas Obscura).
 
@@ -593,18 +607,25 @@ cd ../discovery-butler
 # Install shared/launchd/com.spratt.discovery-butler.plist.example (daily 2pm local).
 # Copy SKILL.md to your OpenClaw skills directory.
 
-# 6. Add Places
+# 6. Add Serendipity Insights
+cd ../serendipity-insights
+cat schemas/insights.sql | sqlite3 ~/.config/spratt/db/insights.sqlite
+# Drop scripts/insights.py into ~/.config/spratt/infrastructure/lib/insights.py,
+# or import the packaged helper from producer scripts.
+# Copy SKILL.md to your OpenClaw skills directory.
+
+# 7. Add Places
 cd ../places
 bash examples/setup.sh
 # Copy SKILL.md to your OpenClaw skills directory
 
-# 7. Add Destination-Aware Reminders
+# 8. Add Destination-Aware Reminders
 cd ../destination-aware
 # Configure HA_URL and HA_TOKEN in ~/.config/home-assistant/config.json
 # Set GOOGLE_PLACES_API_KEY for goplaces
 # Install launchd plist (see shared/launchd/)
 
-# 8. Add Delivery Watcher (on-porch package alerts)
+# 9. Add Delivery Watcher (on-porch package alerts)
 cd ../delivery-watcher
 # Requires an email-scan job that records to delivery_signals.sqlite via
 # the bundled gather-emails.hook.py + HA contact sensor on the front door
@@ -618,14 +639,14 @@ cd ../delivery-watcher
 # First run silently backfills existing delivery signals — no spam on startup.
 # Copy SKILL.md to your OpenClaw skills directory.
 
-# 9. Add Card Wallet (benefits + purchase optimizer)
+# 10. Add Card Wallet (benefits + purchase optimizer)
 cd ../card-wallet
 cat schemas/cards.sql | sqlite3 ~/.config/spratt/db/cards.sqlite
 # Seed your cards, benefits, and reward rates
 # Configure HOLDER_RECIPIENTS in card-wallet-check.py
 # Add Saturday + monthly + quarterly cron jobs to OpenClaw
 
-# 10. Add Meal Planner
+# 11. Add Meal Planner
 cd ../meal-planner
 # Copy SKILL.md + reference docs to your OpenClaw skills directory
 # Requires recipes.sqlite (from recipe-instacart skill) and Instacart (step 4)
