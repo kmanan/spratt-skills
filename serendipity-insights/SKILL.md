@@ -22,8 +22,11 @@ exists.
 
 ## What Belongs Here
 
-Use `upsert_insight` when Spratt notices something potentially useful but not
-commanded directly:
+Serendipity is notice + reconcile + act on structured truth + surface only the
+residue. Use `upsert_insight` only after the relevant source-of-truth store has
+been checked and updated when possible.
+
+The insight queue is for unresolved residue:
 
 - A travel planning gap, such as an upcoming trip with no hotel or anchor meal.
 - A saved place that matches an upcoming trip or current location.
@@ -32,9 +35,42 @@ commanded directly:
 - A discovery recommendation that was surfaced and should not repeat soon.
 - A cross-source pattern that could help a briefing or digest.
 
+Do not store a fact as an insight when it belongs in a deterministic store. If
+an email or weak signal mentions concrete flights, hotels, reservations,
+orders, cards, reminders, or calendar facts, reconcile that against the source
+store first. Update the store through the domain tool when the fact is missing
+or corrected. Mark the weak signal stale or redundant when the fact is already
+confirmed.
+
 The insight should be compact: title, summary, suggested action, source,
 source_ref, evidence JSON, confidence, status, reconciliation_state, and
 surface_policy.
+
+## Reconciliation Contract
+
+Every producer must follow this order:
+
+1. Identify the domain and source-of-truth store.
+2. Extract hard facts from the source.
+3. Check the current store for matching, missing, contradictory, or superseded
+   facts.
+4. If the hard fact is missing or corrected, update the store through the domain
+   tool, not raw SQL.
+5. Regenerate deterministic downstream artifacts when that domain requires it.
+6. Only write an insight for the remaining unresolved optional action.
+
+Examples:
+
+- Travel flights/hotels/reservations -> `trip-db.py` / `trips.sqlite` first,
+  then regenerate trip outbox rows. Only create an insight for a remaining gap
+  such as "pick one anchor dinner."
+- A weak email asking "did you rebook with Delta?" is not an opportunity if
+  confirmation emails or `trips.sqlite` already show the Delta flights. It is
+  redundant evidence and should be stale or ignored.
+- A saved restaurant near an upcoming trip can become an insight only after
+  checking the trip dates, existing reservations, and profile constraints.
+- An expiring card benefit can become an insight only after checking card usage
+  and whether the benefit has already been consumed.
 
 ## What Does Not Belong Here
 
@@ -55,6 +91,7 @@ Do not write candidate opportunities into `MEMORY.md`, person profile Markdown,
 - `reconciled`: checked against deterministic source-of-truth stores and still useful.
 - `surfaced`: already sent or shown; keep for cooldown/dedup history.
 - `stale`: contradicted, expired, or already solved elsewhere.
+- `redundant`: weak signal matched a fact already confirmed in the source store.
 
 Before surfacing an insight, reconcile against the relevant deterministic stores:
 calendar, reminders, trips, saved places, orders, cards, outbox, and current
