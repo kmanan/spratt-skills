@@ -1,144 +1,241 @@
 ---
 name: serendipity-insights
-description: Use when Spratt notices a potentially useful opportunity, pattern, recommendation, or "worth surfacing" idea that is not a direct user command. Routes all such candidates through the shared insights queue instead of memory, profiles, dreaming, heartbeat, or one-off tables.
+description: Use when Spratt notices a potentially useful pattern, recommendation, missing context, or "worth surfacing" idea that is not a direct user command. Producers emit signals into the central reconciliation runtime; they do not write user-facing opportunities directly.
 ---
 
 # Serendipity Insights
 
-This skill is the routing contract for Spratt's insight layer. It does not replace
-the runtime code. It tells agents to use the one runtime layer that already
-exists.
+This skill documents Spratt's current serendipity capability as built in
+production on 2026-06-12.
 
-## Runtime
+Serendipity is not a separate chat bot, generic opportunity inbox, heartbeat
+feature, profile note, or dreaming diary. It is a central reconciliation runtime:
 
-- Shared API: `~/.config/spratt/infrastructure/lib/insights.py`
+```text
+producer signal
+  -> retrieve available context
+  -> reconcile against deterministic source-of-truth stores
+  -> suppress stale/redundant/noisy signals
+  -> write only unresolved residue to db/insights.sqlite
+  -> surface candidates through briefings/digests/discovery surfaces
+```
+
+## Runtime Files
+
+Production paths:
+
+- Central runtime: `~/.config/spratt/infrastructure/lib/serendipity.py`
+- Insight storage helper: `~/.config/spratt/infrastructure/lib/insights.py`
 - Runtime DB: `~/.config/spratt/db/insights.sqlite`
-- Packaged helper: `scripts/insights.py`
-- Packaged schema: `schemas/insights.sql`
 - Profile source: `~/.config/spratt/memory/profiles.json`
-- Main readers: briefing/digest gather via `fetch_surfaceable`
-- Current producers: email-scan opportunities, briefing opportunity refresh,
-  discovery-butler surfaced picks
+- Dream input/ledger state: `~/.config/spratt/state/dream-ledger/`
 
-## What Belongs Here
+Packaged repo files:
 
-Serendipity is notice + reconcile + act on structured truth + surface only the
-residue. Use `upsert_insight` only after the relevant source-of-truth store has
-been checked and updated when possible.
+- `scripts/serendipity.py`
+- `scripts/insights.py`
+- `schemas/insights.sql`
+- `scripts/dreaming/build-dream-input-pack.py`
+- `scripts/dreaming/record-dream-observations.py`
+- `scripts/dreaming/review-dream-observations.py`
+- `scripts/dreaming/run-dream-cycle.py`
+- `tests/test_serendipity_runtime.py`
+- `tests/test_dreaming_phase4.py`
+- `tests/test_dream_cycle_hook.py`
 
-The insight queue is for unresolved residue:
+## Built Producers And Readers
 
-- A travel planning gap, such as an upcoming trip with no hotel or anchor meal.
-- A saved place that matches an upcoming trip or current location.
-- A card benefit, expiring credit, or purchase optimization worth mentioning.
-- A calendar/reminder conflict or opportunity that is not urgent enough for an alert.
-- A discovery recommendation that was surfaced and should not repeat soon.
-- A cross-source pattern that could help a briefing or digest.
+Current producers emit signals through `reconcile_signal()`:
 
-Do not store a fact as an insight when it belongs in a deterministic store. If
-an email or weak signal mentions concrete flights, hotels, reservations,
-orders, cards, reminders, or calendar facts, reconcile that against the source
-store first. Update the store through the domain tool when the fact is missing
-or corrected. Mark the weak signal stale or redundant when the fact is already
-confirmed.
+- email-scan saved opportunities
+- briefing opportunity refresh
+- discovery-butler surfaced picks
 
-The insight should be compact: title, summary, suggested action, source,
-source_ref, evidence JSON, confidence, status, reconciliation_state, and
-surface_policy.
+Current readers:
 
-## Reconciliation Contract
+- briefing/digest gather reads surfaceable rows from `db/insights.sqlite`
+- discovery-butler records surfaced outcomes for cooldown/history
+- dream input pack reads recent insight decisions and outcomes
 
-Every producer must follow this order:
+Old `opportunities.sqlite` is no longer a briefing surface source for this path.
 
-1. Identify the domain and source-of-truth store.
-2. Extract hard facts from the source.
-3. Check the current store for matching, missing, contradictory, or superseded
-   facts.
-4. If the hard fact is missing or corrected, update the store through the domain
-   tool, not raw SQL.
-5. Regenerate deterministic downstream artifacts when that domain requires it.
-6. Only write an insight for the remaining unresolved optional action.
+## Signal Contract
 
-Examples:
+Producers should call:
 
-- Travel flights/hotels/reservations -> `trip-db.py` / `trips.sqlite` first,
-  then regenerate trip outbox rows. Only create an insight for a remaining gap
-  such as "pick one anchor dinner."
-- A weak email asking "did you rebook with Delta?" is not an opportunity if
-  confirmation emails or `trips.sqlite` already show the Delta flights. It is
-  redundant evidence and should be stale or ignored.
-- A saved restaurant near an upcoming trip can become an insight only after
-  checking the trip dates, existing reservations, and profile constraints.
-- An expiring card benefit can become an insight only after checking card usage
-  and whether the benefit has already been consumed.
+```python
+from infrastructure.lib.serendipity import reconcile_signal
 
-## What Does Not Belong Here
+decision = reconcile_signal({
+    "signal_id": "source-stable-id",
+    "source": "email|briefing|discovery|cards|orders|reminders|trips|places|calendar|memory|dreaming|user",
+    "actor": "manan|harshita|both|unknown",
+    "domain_hints": ["travel", "food", "cards"],
+    "raw_context": {
+        "kind": "travel_planning",
+        "title": "Short human-readable title",
+        "summary": "What was noticed",
+        "suggested_action": "Concrete next action, if any",
+        "score": 0.78
+    },
+    "claims": [],
+    "source_refs": [],
+    "created_at": "ISO-8601"
+})
+```
 
-- Human todos: Apple Reminders is the source of truth.
-- Scheduled messages: outbox is the source of truth.
-- Trips: `trips.sqlite` and `memory/trips/*.md` are the source of truth.
-- Durable personal preferences: `memory/profiles.json` is the source of truth.
-- Spratt commitments: `memory/commitments.md` is the source of truth.
-- Infrastructure logs, heartbeat, cron status, stack traces, or health output:
-  `state/ops-history/*.jsonl`, not memory or insights.
+Do not call `upsert_insight()` from producers. In current production,
+`upsert_insight()` is an internal storage helper used by
+`infrastructure.lib.serendipity`.
 
-Do not write candidate opportunities into `MEMORY.md`, person profile Markdown,
-`memory/daily`, `DREAMS.md`, heartbeat output, or a new SQLite table.
+## What The Runtime Does Today
 
-## Status Rules
+Built behavior:
 
-- `candidate`: noticed but not fully reconciled.
-- `reconciled`: checked against deterministic source-of-truth stores and still useful.
-- `surfaced`: already sent or shown; keep for cooldown/dedup history.
-- `stale`: contradicted, expired, or already solved elsewhere.
-- `redundant`: weak signal matched a fact already confirmed in the source store.
+- computes stable decision IDs and stable insight keys
+- records context references and capability status in each decision
+- checks profile availability through `memory/profiles.json`
+- checks available tables in trips, cards, orders, and places stores
+- checks OpenClaw memory-search status and records one of the runtime statuses
+  such as `fts_ok`, `disabled`, `unavailable`, `local_ok`, or `remote_ok`
+- suppresses confirmed duplicate lodging-style signals when `trips.sqlite`
+  already has matching hotel state
+- suppresses low-confidence signals as noise
+- treats dreaming signals as review-only
+- writes unresolved residue to `db/insights.sqlite`
+- exposes `surface_candidates(owner, channel, limit)`
+- records outcomes with `record_outcome(insight_id, outcome, note="")`
 
-Before surfacing an insight, reconcile against the relevant deterministic stores:
-calendar, reminders, trips, saved places, orders, cards, outbox, and current
-profile data.
+Not built yet:
 
-## Surface Rules
+- full domain-specific adapters for every source-of-truth table
+- deterministic auto-writes for missing hard facts beyond existing
+  producer-specific logic
+- automatic promotion of dream observations into production behavior
 
-- Briefings/digests may include only a small number of high-confidence,
-  non-expired insights.
-- Insights suggest action; they do not book, order, schedule, or create
-  reminders without the normal workflow and confirmation rules.
-- Discovery-butler can send a casual nudge, then record the surfaced item as
-  `status="surfaced"` for cooldown and history.
-- Heartbeat must not carry this content.
-- Dreaming must not be used as the production queue.
+## Insight Storage
+
+`db/insights.sqlite` stores the residue and decision audit trail, not the source
+of truth. It has the original insight columns plus:
+
+- `stable_key`
+- `decision_id`
+- `classification`
+- `context_refs_json`
+- `capabilities_json`
+- `actions_json`
+- `surface_channel`
+- `last_surfaced_at`
+- `cooldown_until`
+- `outcome`
+
+Indexes:
+
+- `idx_insights_surface`
+- `idx_insights_source_ref`
+- `idx_insights_stable_key`
+- `idx_insights_decision`
+
+Valid statuses/classes used today include:
+
+- `candidate`
+- `reconciled`
+- `surfaced`
+- `stale`
+- `suppressed`
+- `already_true`
+- `optional_residue`
+- `noise`
+- `needs_review`
+
+## Source-Of-Truth Boundary
+
+Hard facts belong in deterministic stores, not insights:
+
+- trips/flights/hotels/reservations: `trips.sqlite` through trip-manager tools
+- reminders: Apple Reminders/remindctl
+- scheduled messages: outbox
+- saved places: places store
+- orders/carts: order and Instacart stores
+- cards/benefits: card wallet store
+- durable preferences: profile/memory workflow, not insight rows
+- infrastructure logs, heartbeat, cron status, stack traces: ops history, not
+  memory, dreaming, or insights
+
+An insight is only the unresolved residue after the source-of-truth check.
+
+## Dreaming Integration
+
+Dreaming is wired as a review loop, not as production authority.
+
+Built files:
+
+- `build-dream-input-pack.py` reads recent insight decisions, profile context,
+  and recent outbox outcomes, then writes
+  `state/dream-ledger/input-packs/YYYY-MM-DD.json`
+- `run-dream-cycle.py` builds the pack, asks OpenClaw for strict JSON
+  observations, and records them
+- `record-dream-observations.py` validates structured observations and appends
+  pending rows to `state/dream-ledger/dream-observations.jsonl`
+- `review-dream-observations.py` lists, rejects, or promotes reviewed
+  observations
+
+Hard rule:
+
+- Dreaming may not write memory, profiles, reminders, trips, outbox, or surfaced
+  insights directly.
+- Dreaming output starts as `pending_review`.
+- Promotion happens only through the review command.
+
+Current OpenClaw schedule:
+
+- Job id: `0fe5eb3b-0cfe-4849-a66e-bde549959903`
+- Name: `Serendipity Dream Cycle`
+- Schedule: `17 4 * * 0` in `America/Los_Angeles`
+- Payload kind: `command`
+- Command:
+  `/usr/bin/python3 /Users/spratt/.config/spratt/infrastructure/dreaming/run-dream-cycle.py --days 14 --limit 10 --dream-stage rem --model openai/gpt-5.5`
+- Delivery: none
+- Failure alert: after 1 failed run to Manan over iMessage
+- Repo mirror: `~/.config/spratt/infrastructure/cron-jobs.json`
 
 ## Inspection
 
+Recent decisions:
+
 ```bash
 sqlite3 ~/.config/spratt/db/insights.sqlite \
-  "SELECT status, kind, owner, title, source, source_ref, updated_at FROM insights ORDER BY updated_at DESC LIMIT 20;"
+  "SELECT status, classification, kind, owner, title, source, source_ref, updated_at FROM insights ORDER BY updated_at DESC LIMIT 20;"
 ```
 
-## Minimal Write Pattern
+Surfaceable rows:
 
 ```python
-from infrastructure.lib.insights import upsert_insight
+from infrastructure.lib.serendipity import surface_candidates
 
-upsert_insight(
-    kind="travel_planning",
-    owner="manan",
-    title="Plan one anchor meal for Lisle",
-    summary="Upcoming trip has no meal or activity anchor yet.",
-    suggested_action="Pick one vegetarian-friendly dinner near the hotel.",
-    source="briefing",
-    source_ref="trip-2026-06-17-lisle:anchor-meal",
-    evidence={"trip_id": "trip-2026-06-17-lisle"},
-    confidence=0.78,
-    status="candidate",
-    reconciliation_state="unreconciled",
-    surface_policy="optional",
-)
+items = surface_candidates("manan", channel="briefing", limit=3)
 ```
 
-## Failure Mode To Avoid
+Pending dream observations:
 
-Do not create another "intelligence layer." If a new producer notices something,
-wire it into `db/insights.sqlite`. If a new surface wants ideas, read from
-`fetch_surfaceable`. The skill exists to prevent parallel queues and memory
-pollution.
+```bash
+python3 ~/.config/spratt/infrastructure/dreaming/review-dream-observations.py list --status pending_review --limit 20
+```
+
+Dry-run the dream hook without a model call:
+
+```bash
+python3 ~/.config/spratt/infrastructure/dreaming/run-dream-cycle.py --dry-run --days 14 --limit 10
+```
+
+## Failure Modes To Avoid
+
+- Do not create another intelligence layer.
+- Do not add heartbeat content for serendipity.
+- Do not write active todos into profiles or memory.
+- Do not write ops/log/cron/heartbeat status into memory or dreaming.
+- Do not ask the user a generic "pick an anchor" question when Spratt has
+  profile, trip, location, place, or reservation tools that can produce concrete
+  candidates.
+- Do not surface a weak signal when deterministic stores already confirm the
+  fact. Mark it stale/redundant or suppress it.

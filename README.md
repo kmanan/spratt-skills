@@ -108,19 +108,19 @@ A friend who knows the area and occasionally texts you a fun spot. Daily 2:00pm 
 | **macOS-specific** | launchd plist is macOS-specific; underlying script is portable. |
 | **Setup time** | ~10 minutes once `wanderlust-goat-pp-cli` is installed and `GOOGLE_PLACES_API_KEY` is in env. |
 
-### 6. [Serendipity Insights](./serendipity-insights/) — One Queue for Useful Things Spratt Notices
+### 6. [Serendipity Insights](./serendipity-insights/) — Central Reconciliation for Useful Things Spratt Notices
 
-A shared SQLite-backed candidate insight layer. Producers such as email scan, briefing opportunity refresh, discovery-butler, saved places, trips, cards, and calendar/reminder checks can write compact "worth surfacing" candidates to one table. Surfaces such as briefings and digests read from that queue after deterministic reconciliation. This keeps serendipity out of profile Markdown, `MEMORY.md`, heartbeat, dreaming, and one-off side tables.
+A central reconciliation runtime plus SQLite-backed insight ledger. Producers such as email scan, briefing opportunity refresh, and discovery-butler emit signals through `reconcile_signal()`; they do not write user-facing opportunities directly. The runtime checks available source-of-truth context, suppresses stale/redundant/noisy signals, and writes only unresolved residue to `db/insights.sqlite`. Surfaces such as briefings and digests read from that ledger. Dreaming is wired as a pending-review observation loop, not as production authority.
 
-**Why it exists:** Spratt needs room to notice patterns and useful opportunities without turning memory into a junk drawer or letting every feature invent its own recommendation queue. The insight table stores candidates and surfaced items; source-of-truth facts stay in their real systems.
+**Why it exists:** Spratt needs room to notice patterns and useful opportunities without turning memory into a junk drawer, asking generic questions when tools can produce concrete candidates, or letting every feature invent its own recommendation queue. The central runtime records decisions and unresolved residue; source-of-truth facts stay in their real systems.
 
 | | |
 |---|---|
-| **What you get** | `SKILL.md` routing contract, `scripts/insights.py` shared helper, `schemas/insights.sql`; discovery-butler runtime writes surfaced picks into the queue. |
-| **Dependencies** | Python 3, SQLite, existing Spratt source-of-truth stores. |
-| **Schedule** | N/A. Producers write when they run; surfaces read when composing briefings/digests or recommendations. |
+| **What you get** | `SKILL.md` routing contract, `scripts/serendipity.py` central runtime, `scripts/insights.py` storage helper, migrated SQLite schema, dream input/ledger/review scripts, focused tests. |
+| **Dependencies** | Python 3, SQLite, OpenClaw CLI for memory-status checks and the scheduled dream hook, existing Spratt source-of-truth stores. |
+| **Schedule** | Producers write when they run; surfaces read when composing briefings/digests or recommendations. The dream hook is scheduled weekly through OpenClaw cron as `Serendipity Dream Cycle` (`17 4 * * 0` PT). |
 | **macOS-specific** | No. |
-| **Setup time** | ~5 minutes; copy the helper into `~/.config/spratt/infrastructure/lib/insights.py` or import the packaged helper directly. |
+| **Setup time** | ~10 minutes; copy the runtime files into `~/.config/spratt/infrastructure/lib/` and `~/.config/spratt/infrastructure/dreaming/`, apply the schema, then add or restore the OpenClaw cron job from the Spratt cron mirror. |
 
 ### 7. [Outlook Graph](./outlook-graph/) — Outlook Email & Calendar via Microsoft Graph
 
@@ -610,8 +610,12 @@ cd ../discovery-butler
 # 6. Add Serendipity Insights
 cd ../serendipity-insights
 cat schemas/insights.sql | sqlite3 ~/.config/spratt/db/insights.sqlite
-# Drop scripts/insights.py into ~/.config/spratt/infrastructure/lib/insights.py,
-# or import the packaged helper from producer scripts.
+# Drop scripts/insights.py into ~/.config/spratt/infrastructure/lib/insights.py.
+# Drop scripts/serendipity.py into ~/.config/spratt/infrastructure/lib/serendipity.py.
+# Drop scripts/dreaming/*.py into ~/.config/spratt/infrastructure/dreaming/.
+# Producers should call infrastructure.lib.serendipity.reconcile_signal().
+# Do not call upsert_insight() directly from producers.
+# Restore/add the OpenClaw cron command job from the live Spratt cron mirror if needed.
 # Copy SKILL.md to your OpenClaw skills directory.
 
 # 7. Add Places
